@@ -96,10 +96,10 @@ index ccbb188..777aca4 100644
  
 +#if defined(SWEET)
 +	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-+	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (0xfdfff000 + 2404 * 4352)
 +	mov		w1, #-1
 +	mov		x2, #32
-+	mov		x4, #4320
++	mov		x4, #4352
 +Lsweet_mark_row:
 +	mov		x3, #64
 +	mov		x5, x0
@@ -116,24 +116,31 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,23 @@ Lkernelcache_base_found:
+@@ -609,6 +628,30 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
 +#if defined(SWEET)
 +	/*
-+	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
++	 * Splash framebuffer: two 32MB Normal-NC blocks in the EXISTING V=P
 +	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
 +	 * create_bootstrap_mapping would replace the RAM L2 table.
-+	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
-+	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * KL7 uses a 16K granule; the framebuffer starts at 0xfdfff000 and crosses
++	 * the 0xfe000000 L2-block boundary, so map both physical blocks in-place.
 +	 */
-+	MOV64	x10, 0x9c000000
++	MOV64	x10, 0xfc000000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 +	orr		x11, x11, x10
 +	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 +	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
 +	add		x13, x25, #(2 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	/* The KL7 framebuffer crosses into the next 32 MiB block. */
++	MOV64	x10, 0xfe000000
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
 +	str		x11, [x13, x12, lsl #TTE_SHIFT]
 +#endif
 +
@@ -145,7 +152,7 @@ new file mode 100644
 index 0000000..8f4c808
 --- /dev/null
 +++ b/osfmk/arm64/sweet_early.c
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,138 @@
 +/*
 + * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
 + * per-CPU state: panic() can reach this before a current thread exists.
@@ -158,10 +165,10 @@ index 0000000..8f4c808
 +#include <stdint.h>
 +#include <kern/misc_protos.h>
 +
-+#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x9c000000)
++#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0xfdfff000)
 +#define EARLY_WIDTH 1080u
-+#define EARLY_HEIGHT 2400u
-+#define EARLY_STRIDE (4320u / 4)
++#define EARLY_HEIGHT 2436u
++#define EARLY_STRIDE (4352u / 4)
 +#define EARLY_SCALE 2u
 +#define EARLY_CELL_W (8u * EARLY_SCALE)
 +#define EARLY_CELL_H (16u * EARLY_SCALE)
@@ -245,7 +252,11 @@ index 0000000..8f4c808
 +		}
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
++	#if defined(KL7)
++	sweet_early_string("KL7 EARLY ");
++#else
 +	sweet_early_string("SWEET EARLY ");
++#endif
 +	sweet_early_putc((char)('0' + stage));
 +	sweet_early_string(": ");
 +	sweet_early_string(label);
@@ -259,7 +270,11 @@ index 0000000..8f4c808
 +		return;
 +	}
 +	early_panicking = 1;
++	#if defined(KL7)
++	sweet_early_string("\nKL7 EARLY PANIC: ");
++#else
 +	sweet_early_string("\nSWEET EARLY PANIC: ");
++#endif
 +	va_list copy;
 +	va_copy(copy, *args);
 +	_doprnt(fmt, &copy, sweet_early_putc, 16);

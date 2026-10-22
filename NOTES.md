@@ -1,3 +1,42 @@
+# KL7 XNU port — active handoff (2026-10-22)
+
+## Target / next milestone
+
+This working tree is an in-progress port of iOS 16-generation XNU (`xnu-8796`) to the Tecno Spark 30 Pro KL7 / MediaTek MT6789. Linux ports are not in scope. It is based on the supplied `ios-sweet` snapshot at git SHA `11da58bd050672960c0a83b5bef2176047eea479`; the upstream XNU tree is fetched by the pinned `blacktop/darwin-xnu-build` workflow, not included here.
+
+The next milestone is **the first real XNU Mach-O handoff through ios-kl7 shim**, with `cpus=1` and a ramdisk root. Do not spend time on UFS, SMP, USB boot UI, recovery or Android chainload first. A synthetic payload boot is not evidence that XNU booted.
+
+## Verified hardware / shim facts
+
+- Shim v0.9.2: WDT at `0x10007000` was disabled using MODE key `0x22000000`; MODE read back as `0x7c`, and the device survived a 45-second wait. The XNU handoff build must disable it.
+- The shim has already verified 16K-granule MMU mappings, all eight cores via PSCI and GICv3; no real XNU Mach-O has been run through it yet.
+- KL7 DTB parsing verifies upper XNU-managed DRAM `0x140000000..0x23fffefff`, GICD `0x0c000000`, GICR `0x0c040000`, timer frequency 13 MHz, virtual timer INTID 27, and reserved framebuffer `0xfdfff000`, 1080×2436, stride 4352.
+- CPU topology is 6 Cortex-A55 + 2 Cortex-A76. The generated bring-up ADT uses a temporary flat topology; first boot must stay `cpus=1`.
+
+## Current worktree changes
+
+- Added `MACHINE_CONFIG=KL7`, board header, and patch `0082-kl7-machine-config.patch`; target is plain arm64/no PAC. `ARM64_BOARD_CONFIG_SWEET` / `SWEET` are temporary compatibility switches to reuse iOS-on-MacOS portability workarounds, not claims about KL7 silicon. Revisit this split after first boot.
+- Adapted early framebuffer mappings in `0010`/`0012` to KL7. Since the framebuffer starts 4 KiB before a 32 MiB mapping boundary and crosses it, the bootstrap and post-TTBR0 alias map both adjacent 32 MiB blocks.
+- Added KL7 platform identity and Cortex-A55 personality matching.
+- Added `tools/mkadt_kl7.py`, deriving memory/GIC/timer/framebuffer facts from the supplied DTB. UFS is omitted by default; `--with-ufs` is opt-in. `/product` is intentionally omitted unless a real D22AP ADT is supplied.
+- Added `tools/mkpayload_kl7.py` for the shim's existing `SWEETXNU` payload format. The magic is retained for binary compatibility.
+- CI now defaults to `machine_config=KL7`, XNU era 13.5 (`xnu-8796`), DEVELOPMENT.
+
+## Local validation status
+
+- KL7 FDT-to-ADT generation succeeds against the supplied `fdt.dtb`: output was 9,988 bytes; timer 13 MHz / INTID 27; correct GIC ranges and framebuffer geometry.
+- Python syntax checks for the KL7 helper scripts pass. Patch files were checked for unified-diff syntax only.
+- **Not verified here:** applying the patch series to a real xnu-8796 checkout, compiling XNU, producing a payload from a real kernel Mach-O, or booting it. Network DNS in the local execution environment does not resolve GitHub; the GitHub Actions workflow is the place to validate application and compilation against the pinned source.
+
+## Immediate actions
+
+1. Run `python3 tools/mkadt_kl7.py out/kl7.adt --dtb /path/to/fdt.dtb` without `--with-ufs`.
+2. Run the workflow with `machine_config=KL7`, `kernel_config=DEVELOPMENT`, `macos_version=13.5`; inspect **all** patch-apply and compiler output, not only whether artifacts uploaded.
+3. Fix build failures against the actual xnu-8796 tree; do not guess at upstream context from patch syntax.
+4. Only after a clean XNU build, package the actual arm64 kernel Mach-O with `tools/mkpayload_kl7.py`, ramdisk and KL7 ADT; boot via the existing shim with `cpus=1 rd=md0` and WDT disable. Capture ramoops and record the exact first XNU-originated marker/panic.
+
+---
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)

@@ -302,7 +302,7 @@ index 9454534..88e524a 100644
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
  #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
  
-+#ifdef ARM64_BOARD_CONFIG_SWEET
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_KL7)
 +#include <pexpert/arm64/SWEET.h>
 +
 +#define MAX_L2_CLINE                   6
@@ -311,7 +311,7 @@ index 9454534..88e524a 100644
 +
 +#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
 +
-+#endif  /* ARM64_BOARD_CONFIG_SWEET */
++#endif  /* ARM64_BOARD_CONFIG_SWEET && !ARM64_BOARD_CONFIG_KL7 */
 +
  #ifdef ARM64_BOARD_CONFIG_VMAPPLE
  #include <pexpert/arm64/VMAPPLE.h>

@@ -1,3 +1,7 @@
+> **KL7 port work is in progress.** For Tecno Spark 30 Pro (MT6789), use [XNU-KL7-PORT-PLAN.md](XNU-KL7-PORT-PLAN.md), `tools/mkadt_kl7.py`, `tools/mkpayload_kl7.py`, and CI `machine_config=KL7`. The original `tools/mkadt.py` and `MACHINE_CONFIG=SWEET` instructions below describe the reference Redmi Note 10 Pro and are not the KL7 hardware profile. The first KL7 milestone is a single-core XNU marker; the Sweet UFS/display/touch drivers are **not** considered KL7-compatible.
+
+---
+
 # ios-sweet
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**

@@ -11,7 +11,7 @@ on:
         default: DEVELOPMENT
       machine_config:
         description: xnu MACHINE_CONFIG
-        default: SWEET
+        default: KL7
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -19,6 +19,9 @@ on:
     branches: [main]
     paths:
       - "xnu/patches/**"
+      - "tools/mkadt_kl7.py"
+      - "tools/mkpayload_kl7.py"
+      - "XNU-KL7-PORT-PLAN.md"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -30,7 +33,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'KL7' }}
 
 jobs:
   build:

@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 new file mode 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,175 @@
 +/*
 + * Single-CPU bring-up for sweet using XNU's legacy IOCPU interface.
 + * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
@@ -57,7 +57,11 @@ new file mode 100644
 +	if (!IOCPU::start(provider)) {
 +		return false;
 +	}
++#if defined(KL7)
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A55");
++#else
 +	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
 +	if (cpuName == NULL) {
 +		return false;
 +	}
@@ -177,14 +181,18 @@ new file mode 100644
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -41,6 +41,12 @@
+@@ -41,6 +41,16 @@
      "     'IONameMatch'     = 'xiaomi,sweet';"
      "     'IOProbeScore'    = 10000:32;"
      "   },"
 +    "   {"
 +    "     'IOClass'         = SweetCPU;"
 +    "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_KL7)
++    "     'IONameMatch'     = 'arm,cortex-a55';"
++#else
 +    "     'IONameMatch'     = 'qcom,kryo470';"
++#endif
 +    "     'IOProbeScore'    = 10000:32;"
 +    "   },"
  #endif
