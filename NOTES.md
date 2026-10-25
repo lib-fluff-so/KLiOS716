@@ -470,3 +470,18 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## 2026-10-25: v0114 — sampler v2 (x16/state) and the 0101 framebuffer skip
+- Patch train 0101..0111 committed. v0114 kernel built on the VM with MACHINE_CONFIG=SWEET,
+  xnu-8796.141.3; sha256 6689ce2e67d97b8240fc226d2d981e214ca181c6ab1a0c0993bb2b6078f719b2.
+  Verified: the 0111 format string ("x16 0x%llx x0") is present in the binary.
+- 0111 makes the sampler print saved x16 (dyld direct-syscall number), x0 and thread->state,
+  and samples every 45 s (40 max), so a multi-minute syscall is caught repeatedly.
+- Known defect: build.sh rejects 0101-kl7-early-framebuffer-geometry with "corrupt patch at line 83"
+  and silently continues, so v0113 and v0114 were built without it. Consequence: the early console
+  and fbcon still target sweet's 0x9c000000 instead of the KL7 panel page 0xFE519E00
+  (1080x2436, stride 4352) — the kernel draws nothing on the KL7 panel. 0101 is kept only for the
+  record; 0112 replaces it with a patch generated against the applied tree.
+- Also note: the build VM's copies of 0004/0010/0012/0016/0018 are the pre-KL7-machine-config
+  variants (no ARM64_BOARD_CONFIG_KL7 guards, early FB at 0x9c000000) and 0082 is absent,
+  unlike the committed KL7-config variants. Builds v0113/v0114 used the VM copies.

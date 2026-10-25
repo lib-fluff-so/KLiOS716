@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: KL7 <kl7@localhost>
+Date: Sun, 25 Oct 2026 12:40:00 +0300
+Subject: [PATCH] kl7: publish the display nub under /arm-io
+
+IOMobileFramebuffer.framework counts /arm-io children with
+device_type "display-subsystem" before it opens the matching
+IOMobileFramebuffer service.  SweetPlatformExpert previously attached the
+disp0 nub directly to the platform expert, so /arm-io had no children and
+userland never opened the published AppleCLCD service.
+
+Create a real /arm-io nub and attach disp0 (and the other arm-io devices)
+below it.  IOPlatformDevice normally resolves its name and resources
+through its direct provider, which only works when that provider is the
+platform expert; add SweetPlatformDevice to keep that resolution working
+for nubs below /arm-io.
+
+The display service itself is unchanged, so AppleCLCD still matches the
+existing disp0 properties.
+---
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,12 +10,53 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++/*
++ * IODTPlatformExpert's IOPlatformDevice asks its provider for the nub name
++ * and resources.  That works while every nub is a direct child of the
++ * platform expert, but not once /arm-io becomes a real container.  Keep the
++ * platform expert explicitly so the display nub can live at /arm-io/disp0
++ * and still match AppleCLCD.
++ */
++class SweetPlatformDevice : public IOPlatformDevice {
++	OSDeclareDefaultStructors(SweetPlatformDevice);
++
++	IOPlatformExpert *fExpert;
++
++public:
++	void setExpert(IOPlatformExpert *expert) { fExpert = expert; }
++	bool compareName(OSString *name, OSString **matched = 0) const APPLE_KEXT_OVERRIDE;
++	IOReturn getResources(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetPlatformDevice, IOPlatformDevice);
++
++bool
++SweetPlatformDevice::compareName(OSString *name, OSString **matched) const
++{
++	if (fExpert != NULL) {
++		return fExpert->compareNubName(this, name, matched);
++	}
++	return IOPlatformDevice::compareName(name, matched);
++}
++
++IOReturn
++SweetPlatformDevice::getResources(void)
++{
++	if (fExpert != NULL) {
++		return fExpert->getNubResources(this);
++	}
++	return IOPlatformDevice::getResources();
++}
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
++	IOService *fArmIONub;
++
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
++	IOService *createNub(IORegistryEntry *from) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ };
+@@ -26,6 +67,7 @@
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	IOLog("SWEET: starting device-tree platform expert\n");
++	fArmIONub = NULL;
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
+@@ -34,6 +76,21 @@
+ 	return true;
+ }
+ 
++IOService *
++SweetPlatformExpert::createNub(IORegistryEntry *from)
++{
++	SweetPlatformDevice *nub = new SweetPlatformDevice;
++
++	if (nub != NULL) {
++		nub->setExpert(this);
++		if (!nub->init(from, gIODTPlane)) {
++			nub->free();
++			return NULL;
++		}
++	}
++	return nub;
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {
+@@ -43,7 +100,7 @@
+ const char *
+ SweetPlatformExpert::excludeList(void)
+ {
+-	return "('chosen', 'defaults', 'cpus', 'options')";
++	return "('chosen', 'defaults', 'cpus', 'options', 'arm-io')";
+ }
+ 
+ void
+@@ -63,13 +120,22 @@
+ 
+ 	/*
+ 	 * No AppleARMIO driver publishes the /arm-io children: do it here so
+-	 * built-in drivers (the display, AppleCLCD) can match them. The GIC is
+-	 * driven by the platform code and gets no nub. The nubs hang off this
+-	 * platform expert: IOPlatformDevice::compareName asks its provider.
++	 * built-in drivers (the display, AppleCLCD) can match them.  Keep
++	 * disp0 below a real /arm-io nub: IOMobileFramebuffer.framework counts
++	 * display-subsystem children of /arm-io before it opens IOMFB.
++	 * SweetPlatformDevice keeps IOPlatformDevice matching working even
++	 * though the nub's direct provider is no longer the platform expert.
++	 * The GIC is driven by the platform code and gets no nub.
+ 	 */
+ 	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
+ 	if (armio != NULL) {
+-		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
++		fArmIONub = createNub(armio);
++		if (fArmIONub != NULL) {
++			fArmIONub->attach(this);
++			fArmIONub->registerService();
++			createNubs(fArmIONub,
++			    IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
++		}
+ 		armio->release();
+ 	}
+ }
