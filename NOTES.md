@@ -485,3 +485,42 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Also note: the build VM's copies of 0004/0010/0012/0016/0018 are the pre-KL7-machine-config
   variants (no ARM64_BOARD_CONFIG_KL7 guards, early FB at 0x9c000000) and 0082 is absent,
   unlike the committed KL7-config variants. Builds v0113/v0114 used the VM copies.
+
+## 2026-10-25: v0117 — KL7 UFS HS-G3 on hardware, and the display DT-plane bug
+- UFS HS is opt-in: boot arg `ufshs=1`. Default remains PWM-G1, so Android/other payloads are
+  unaffected. The g3 train is patches 0115 (I/O stats), 0116 (timed phases + 1 MiB bench) and
+  0117 (HS-G3: 2 lanes, series B, FAST 0x11, wait for `IS.UIC_POWER_MODE` 0x10 and
+  `HCS.UPMCRS == PWR_LOCAL (1)`).
+- Shim-only probe (64 x 1 MiB reads, residual transfer count accounted): 817263-819026 KiB/s.
+  XNU g3 kernel sha256 17826589a16f2c4c62c1948e429fbfcee4408f3847128d5605f5711b3b1f5759;
+  shim_b sha256 9777b04764eddbb04e7671ab74f2532f7fd9b6d65b8606bad3eada5956a1a764.
+- XNU evidence from the last 4100 KiB of `iosroot` (/dev/block/sdc69, 88,014,784 bytes):
+  `KL7 UFS: HS ACTIVE pwr 0x11 gear 3 hcs 0x10f`; `pwr_0x11 done is 0x10 hcs 0x10f upmcrs 1`;
+  `txgear_readback=3 rxgear_readback=3`; `SWEET UFS BENCH: nosync 1048576 x4 791721 KiB/s`
+  and sync 750299 KiB/s; `hfs: mounted iOSRoot`; `exec launchd`. iOS reached SpringBoard in
+  ~30-50 s with boot_b active; Android A was restored afterwards and remained bootable.
+- SpringBoard then crash-looped: 30 identical crashes plus one driverkitd crash,
+  `*** Assertion failure in -[SBMainDisplayConfigurationTransformer transformDisplayConfiguration:]`
+  at `SBMainDisplayConfigurationTransformer.m:62`, with
+  `NSInternalInconsistencyException: We expect a valid bounds for configuration: ... Main-External;
+  mode: "0x0 0Hz sRGB SDR"`, `CADisplay.name = Wireless`, `deviceName = wireless0`,
+  `availableModes: 0`. No `SWEET FB: AppleCLCD` line exists in the log.
+- Root cause is the display hierarchy, not UFS. `IOMobileFramebuffer.framework` (inside backboardd)
+  counts `/arm-io` children with `device_type = display-subsystem` through the **IODeviceTree
+  plane**: `IOK backboardd: path IODeviceTree:/arm-io -> SweetPlatformDevice`,
+  `IOK backboardd: children of arm-io in IODeviceTree`, then it waits for
+  `IOServiceFirstMatch ... IOProviderClass = IOMobileFramebuffer`. Patch 0110 created the
+  `/arm-io` nub and `disp0` below it, but `createNubs()` links nubs only in the service plane;
+  the DT-plane child iterator on `/arm-io` is empty, so the framework sees zero displays, never
+  opens AppleCLCD, and SpringBoard falls back to the Wireless display.
+- Patch 0118 mirrors the `/arm-io` service-plane children into the DT plane after `createNubs()`
+  with `child->attachToParent(fArmIONub, gIODTPlane)`. AppleCLCD matching is already correct:
+  `SweetPlatformDevice::compareName` -> `SweetPlatformExpert::compareNubName` ->
+  `IODTCompareNubName`, which checks `name`, `compatible`, `device_type` and `model`; the
+  `disp0` node's `compatible` (`tecno,kl7-display`) matches `IONameMatch`, so no ADT change is
+  needed. The new kernel (sha256 7e8ef74e9e5976ce5cbfe7d4fbc5015f033e2b854c07ff7472bfc3bee9d5ec05)
+  and shim (sha256 ca319f0b62e7c701a0853a403c73733f536caa6acbdcd03d1f7c98303d1a8d28) keep the
+  proven g3 ADT (10,412 bytes) and cmdline; the 0118 hardware test is pending.
+- Repo now lives on the VM at `/Users/dev/ios-sweet`; the host `/home/fluff_/ios-sweet` is a
+  read-only snapshot. Flash only `boot_b`; keep Android A as the fallback; restore A with
+  Antumbra after each XNU test.
