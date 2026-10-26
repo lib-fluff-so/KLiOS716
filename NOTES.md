@@ -481,7 +481,8 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   and silently continues, so v0113 and v0114 were built without it. Consequence: the early console
   and fbcon still target sweet's 0x9c000000 instead of the KL7 panel page 0xFE519E00
   (1080x2436, stride 4352) — the kernel draws nothing on the KL7 panel. 0101 is kept only for the
-  record; 0112 replaces it with a patch generated against the applied tree.
+  record; it is still skipped by build.sh. (0112 is the separate KL7 touch driver and
+  applies cleanly; see below.)
 - Also note: the build VM's copies of 0004/0010/0012/0016/0018 are the pre-KL7-machine-config
   variants (no ARM64_BOARD_CONFIG_KL7 guards, early FB at 0x9c000000) and 0082 is absent,
   unlike the committed KL7-config variants. Builds v0113/v0114 used the VM copies.
@@ -524,3 +525,65 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Repo now lives on the VM at `/Users/dev/ios-sweet`; the host `/home/fluff_/ios-sweet` is a
   read-only snapshot. Flash only `boot_b`; keep Android A as the fallback; restore A with
   Antumbra after each XNU test.
+
+## 2026-10-25: v0119-v0120 — KL7 display/canvas fix
+
+### v0119 canvas fix
+KL7 ADT `disp0` canvas was `1080x2436` (panel), but `SweetFramebuffer::GetDisplaySize`
+reported the iPhone X present size `1125x2436`; backboardd matched every surface against
+`AppleM2ScalerCSCDriver` and never swapped. Setting the KL7 `disp0` canvas to `1125x2436`
+(keeping `fbcon` at 1080x2436) eliminated the scaler match loop; migration completed
+(71 swaps, `FBSDisplayMode 375x812@3x (1125x2436/3) 60Hz`).
+
+### v0120 SpringBoard crash fix
+SpringBoard then crashed loading `BoundingPathBitmap-1125x2436-375x812-3.00x`; the asset
+exists, but ACM context creation failed. Fix: add `/product` to the KL7 ADT
+(`certificate-production-status`/`effective-production-status-ap` 0,
+`effective-security-mode-sep` 1), keep `disp0` canvas at panel size `1080x2436`, and boot
+with `sweetfb_native=1` so AppleCLCD presents 1080x2436 and UIKit looks up the existing
+`BoundingPathBitmap-1080x2436` asset. Verified: SpringBoard launched and the phone reached
+the iOS lockscreen. Android A on slot `_a` remained untouched; only `boot_b` was flashed.
+
+### Open items
+- `/product` properties are hardcoded until a real D22AP ADT is available.
+- Native 1080x2436 presentation differs from iPhone X layout, but SpringBoard runs.
+- No GPU/IOAccelerator path; CPU rendering only.
+
+## 2026-10-26: v0121 — KL7 FTS3519 touch works on hardware (0112)
+
+- Added `0112-kl7-fts3519-touch.patch`: new `bsd/dev/kl7_fts_touch.c` for the
+  FocalTech FT3519 on MT6789 SPI1 (0x11010000, CS0). It uses the same path
+  validated by the KL7 shim: SPI1 pinmux GPIO34-37 function 1, AVDD GPIO61,
+  RESET GPIO116, IFRAO SPI1 gate CLR, 32/32/7-byte PIO chunks for the 71-byte
+  SPI transaction (62-byte report payload), and 2 ms settle after each ACT.
+  No DMA and no FTS IRQ; the driver polls register 0x01 every 10 ms from a
+  kernel thread.
+- The report parser follows the FT3519 layout: dummy, count, then six bytes
+  per point. It stops at unused records (YH high nibble > 9 or zero area),
+  caps down records by the reported count, handles up records for release, and
+  rejects truncated frames instead of creating ghost contacts.
+- The driver is compiled only for `ARM64_BOARD_CONFIG_SWEET`. `sweet_ufs.c`
+  selects it at runtime: `su.mtk` -> `kl7_fts_touch_init()`, otherwise
+  `sweet_touch_init()`. `sweet_touch.c` is unchanged and is not called on KL7.
+- Coordinates go to `sweet_hid_touch(finger, down, x, y)`; Y is scaled from the
+  2436-pixel panel to the service's 2400-unit range. Boot args: `kl7touch=0`
+  disables, `kl7touchdelay=N` sets the start delay (default 1 s, capped at 60 s).
+- Build: XNU in the macOS VM as `MACHINE_CONFIG=SWEET`,
+  `KERNEL_CONFIG=DEVELOPMENT`; kernel sha256
+  `6bca36e9840268287fd70827de6613e571817100c13622377649a66c00a0a2d8`.
+- Payload: `out-v0121-touch/shim_b.img`, 16,646,144 bytes, sha256
+  `ac3b939e4a0422a0cae7609d94be9069da5c253f9bbe3db89f0f0dd4dae42876`;
+  ADT 10,624 bytes with `/product`, canvas 1080x2436, stride 4352; cmdline has
+  `ufshs=1 sweetfb_native=1`.
+- Flashed only `boot_b`; Android A remains the fallback. User confirmed touch
+  input works on the phone ("тач то есть"); multitouch/gestures were not
+  separately exercised.
+- Patch order checked: final 0112 (sha256
+  `ad759efc17768a55391185df6884c5482289616cf49ffb4dcec170d3e9ab5b09`)
+  applies to baseline 0001..0111; applying 0112 then 0115/0116/0117 produces
+  byte-identical `bsd/dev/sweet_ufs.c`, `bsd/conf/files` and driver to the VM
+  build tree.
+- Fastboot quirk on this ABL: `fastboot set_active b` returns OKAY, but
+  `fastboot getvar current-slot` still reports `a`; the payload on `boot_b`
+  nevertheless ran and touch worked. Do not flash `boot_a`; keep using
+  `flash boot_b`.
