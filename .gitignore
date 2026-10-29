@@ -1,0 +1,49 @@
+# Build outputs
+/out/
+/out-*/
+/build/
+/dist/
+
+# Compiled objects and linker output
+*.o
+*.elf
+*.map
+*.d
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated rootfs and device images
+/rootfs/*.img
+/rootfs/*.raw
+/rootfs/*.bin
+/rootfs/*.sparse
+/rootfs/*.dmg
+/rootfs/*.iso
+/rootfs/*.tar
+/rootfs/*.tar.gz
+/rootfs/*.gz
+
+# VM disks, installer media, and generated OpenCore image
+/vm/img/
+/vm/media/*.dmg
+/vm/media/*.iso
+/vm/media/*.pkg
+/vm/media/*.qcow2
+/vm/OpenCore/OpenCore.qcow2
+
+# Temporary logs and files
+*.log
+*.tmp
+*~
+*.swp
+*.swo
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
