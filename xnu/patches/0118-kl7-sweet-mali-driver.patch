@@ -1,0 +1,3651 @@
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+new file mode 100644
+index 0000000..a17230f
+--- /dev/null
++++ b/bsd/dev/sweet_mali.c
+@@ -0,0 +1,3634 @@
++/*
++ * SweetMali: Mali-G57 (MT6789, Valhall TNAX) GPU bring-up for XNU.
++ *
++ * This is the first XNU milestone.  It is a direct port of the KL7 shim's
++ * proven power-up path (KLiOS716-shim/src/gpu.c): SCPSYS MFG0..3 MTCMOS,
++ * the MFG1 topaxi protection release, the 26 MHz reference mux, MFGPLL at
++ * 390 MHz, the mfg_pll_sel mux, the BG3D gate, the external clock gates,
++ * a soft reset, and the internal L2/shader/tiler power-on.  It then reads
++ * the GPU_ID/feature registers and logs them.
++ *
++ * The PMIC rails (VGPU/VSRAM_GPU) are intentionally left alone: the
++ * bootloader has already enabled them.  A read-only shim boot measured
++ * them on at ~850 mV before any GPU register was touched.  Voltage
++ * scaling belongs to the later DVFS milestone.
++ *
++ * The second milestone adds the GPU MMU (AS0 with 2 MiB identity blocks)
++ * and submits a write-value job through JS0 with START_MMU, then reads the
++ * value back from the CPU.  No compute/tiler jobs, no user client yet.
++ * Every register sequence is the one the shim already proved on this
++ * phone (KLiOS716-shim/src/gpu.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLib.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_console_muted;	/* osfmk/console/serial_console.c */
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++void sweet_mali_init(void);
++
++/* Physical addresses on MT6789 (from the live DTB and the shim log). */
++#define SM_GPU_PA       0x13000000u
++#define SM_GPU_SIZE     0x10000u
++#define SM_MFG_PA       0x13fbf000u
++#define SM_SCPSYS_PA    0x10006000u
++#define SM_INFRA_PA     0x10001000u
++#define SM_TOP_PA       0x10000000u
++#define SM_APMIXED_PA   0x1000c000u
++#define SM_MMIO_SIZE    0x1000u
++
++/* MediaTek SCPSYS (sleep controller) MFG domains. */
++#define SM_MFG0_PWR_CON  0x308u
++#define SM_MFG1_PWR_CON  0x30cu
++#define SM_MFG2_PWR_CON  0x310u
++#define SM_MFG3_PWR_CON  0x314u
++#define SM_PWR_STATUS    0x16cu
++#define SM_PWR_STATUS2   0x170u
++
++#define SM_PWR_RST_B     (1u << 0)
++#define SM_PWR_ISO       (1u << 1)
++#define SM_PWR_ON        (1u << 2)
++#define SM_PWR_ON_2ND    (1u << 3)
++#define SM_PWR_CLK_DIS   (1u << 4)
++#define SM_SRAM_PDN      (1u << 8)
++#define SM_SRAM_PDN_ACK  (1u << 12)
++
++#define SM_MFG0_STA      (1u << 2)
++#define SM_MFG1_STA      (1u << 3)
++#define SM_MFG2_STA      (1u << 4)
++#define SM_MFG3_STA      (1u << 5)
++
++/* INFRA_AO topaxi protection and the broken MFG-to-ACP route. */
++#define SM_PROTECTSTA1       0x228u
++#define SM_PROTECTEN_CLR     0x2a4u
++#define SM_PROTECTSTA1_1     0x258u
++#define SM_PROTECTEN_1_CLR   0x2acu
++#define SM_PROTECTSTA1_2     0x724u
++#define SM_PROTECTEN_2_CLR   0x718u
++
++#define SM_PROT_STEP1_0      (1u << 21)
++#define SM_PROT_STEP1_1      ((1u << 5) | (1u << 6))
++#define SM_PROT_STEP2_0      ((1u << 21) | (1u << 22))
++#define SM_PROT_STEP2_1      (1u << 7)
++
++#define SM_MFG_SLAVE_GALS_CTRL 0x290u
++#define SM_DIS_MFG2ACP_BIT     9u
++
++/* TOPCKGEN mfg_ref/mfg_pll mux (MUX_GATE_CLR_SET_UPD). */
++#define SM_TOP_CLK_CFG_4     0x050u
++#define SM_TOP_CLK_CFG_4_SET 0x054u
++#define SM_TOP_CLK_CFG_4_CLR 0x058u
++#define SM_TOP_CLK_CFG_UPDATE 0x004u
++#define SM_TOP_MFG_REF_SHIFT 16u
++#define SM_TOP_MFG_PLL_SEL   (1u << 18)
++#define SM_TOP_MFG_REF_GATE  (1u << 23)
++#define SM_TOP_MFG_UPDATE    (1u << 18)
++
++/* MFGCFG BG3D setclr gate. */
++#define SM_MFG_BG3D_STA  0x000u
++#define SM_MFG_BG3D_SET  0x004u
++#define SM_MFG_BG3D_CLR  0x008u
++#define SM_MFG_BG3D_BIT  1u
++
++/* APMIXED MFGPLL. */
++#define SM_MFGPLL_CON0      0x268u
++#define SM_MFGPLL_CON1      0x26cu
++#define SM_MFGPLL_CON3      0x274u
++#define SM_MFGPLL_PCW_CHG   (1u << 31)
++#define SM_MFGPLL_POSDIV_S  24u
++
++#define SM_GPU_CLOCK_KHZ    390000u
++#define SM_GPU_PLL_POSDIV   2u
++
++/* Panfrost register map, validated against panfrost_regs.h by the shim. */
++#define SM_GPU_ID                0x000u
++#define SM_GPU_L2_FEATURES       0x004u
++#define SM_GPU_CORE_FEATURES     0x008u
++#define SM_GPU_TILER_FEATURES    0x00cu
++#define SM_GPU_MEM_FEATURES      0x010u
++#define SM_GPU_MMU_FEATURES      0x014u
++#define SM_GPU_AS_PRESENT        0x018u
++#define SM_GPU_JS_PRESENT        0x01cu
++#define SM_GPU_INT_RAWSTAT       0x020u
++#define SM_GPU_INT_CLEAR         0x024u
++#define SM_GPU_INT_MASK          0x028u
++#define SM_GPU_CMD               0x030u
++#define SM_GPU_STATUS            0x034u
++#define SM_GPU_THREAD_MAX_THREADS 0x0a0u
++#define SM_GPU_THREAD_MAX_WG     0x0a4u
++#define SM_GPU_THREAD_MAX_BARRIER 0x0a8u
++#define SM_GPU_THREAD_FEATURES   0x0acu
++#define SM_GPU_TEXTURE_FEATURES(n) (0x0b0u + (n) * 4u)
++#define SM_GPU_JS_FEATURES(n)    (0x0c0u + (n) * 4u)
++#define SM_GPU_AFBC_FEATURES     0x04cu
++#define SM_GPU_SHADER_PRESENT_LO 0x100u
++#define SM_GPU_TILER_PRESENT_LO  0x110u
++#define SM_GPU_L2_PRESENT_LO     0x120u
++#define SM_GPU_COHERENCY_FEATURES 0x300u
++#define SM_GPU_THREAD_TLS_ALLOC  0x310u
++#define SM_GPU_STACK_PRESENT_LO  0xe00u
++#define SM_GPU_SHADER_READY_LO   0x140u
++#define SM_GPU_TILER_READY_LO    0x150u
++#define SM_GPU_L2_READY_LO       0x160u
++#define SM_GPU_SHADER_PWRON_LO   0x180u
++#define SM_GPU_TILER_PWRON_LO    0x190u
++#define SM_GPU_L2_PWRON_LO       0x1a0u
++#define SM_GPU_JM_CONFIG         0xf00u
++#define SM_GPU_SHADER_CONFIG     0xf04u
++
++#define SM_GPU_IRQ_RESET_COMPLETED (1u << 8)
++#define SM_GPU_CMD_SOFT_RESET      0x01u
++#define SM_GPU_CMD_HARD_RESET      0x02u
++#define SM_SC_VAR_ALGORITHM        (1u << 29)
++#define SM_JM_DEFAULT_IDVS_GROUP   (0xfu << 16)
++
++/* GPU MMU (AS0), from the shim's gpu.c. */
++#define SM_MMU_INT_RAWSTAT   0x2000u
++#define SM_MMU_INT_CLEAR     0x2004u
++#define SM_MMU_INT_MASK      0x2008u
++#define SM_MMU_BASE          0x2400u
++#define SM_MMU_AS_SHIFT      6u
++#define SM_MMU_AS(as)        (SM_MMU_BASE + ((as) << SM_MMU_AS_SHIFT))
++#define SM_AS_TRANSTAB_LO(as)     (SM_MMU_AS(as) + 0x00u)
++#define SM_AS_TRANSTAB_HI(as)     (SM_MMU_AS(as) + 0x04u)
++#define SM_AS_MEMATTR_LO(as)      (SM_MMU_AS(as) + 0x08u)
++#define SM_AS_MEMATTR_HI(as)      (SM_MMU_AS(as) + 0x0cu)
++#define SM_AS_LOCKADDR_LO(as)     (SM_MMU_AS(as) + 0x10u)
++#define SM_AS_LOCKADDR_HI(as)     (SM_MMU_AS(as) + 0x14u)
++#define SM_AS_COMMAND(as)         (SM_MMU_AS(as) + 0x18u)
++#define SM_AS_FAULTSTATUS(as)     (SM_MMU_AS(as) + 0x1cu)
++#define SM_AS_FAULTADDRESS_LO(as) (SM_MMU_AS(as) + 0x20u)
++#define SM_AS_FAULTADDRESS_HI(as) (SM_MMU_AS(as) + 0x24u)
++#define SM_AS_STATUS(as)          (SM_MMU_AS(as) + 0x28u)
++
++#define SM_AS_COMMAND_UPDATE      0x01u
++#define SM_AS_COMMAND_LOCK        0x02u
++#define SM_AS_COMMAND_UNLOCK      0x03u
++#define SM_AS_COMMAND_FLUSH_PT    0x04u
++#define SM_AS_COMMAND_FLUSH_MEM   0x05u
++#define SM_AS_STATUS_AS_ACTIVE    0x01u
++#define SM_AS_TRANSTAB_MODE_TABLE 0x03u
++#define SM_AS_TRANSTAB_READ_INNER 0x04u
++#define SM_MALI_MEMATTR           0x888d88u
++
++/*
++ * Panfrost's lock_region(): the region a command applies to is a naturally
++ * aligned power of two, encoded in AS_LOCKADDR as log2(size) - 1, and it may
++ * never be smaller than AS_LOCK_REGION_MIN_SIZE (32 KiB).
++ */
++#define SM_AS_LOCK_MIN_LOG2       15u
++
++/*
++ * Mali's own LPAE dialect, the one panfrost uses on this GPU
++ * (drivers/iommu/io-pgtable-arm-common.c, ARM_MALI_LPAE): the type field is
++ * 0b01 for *every* leaf -- a 2 MiB block and a 4 KiB page alike, at any
++ * level -- and 0b11 only for a pointer to the next table.  Plain ARM LPAE
++ * would write 0b11 on a level-3 page descriptor instead; Mali then reads
++ * that bottom-level entry as a table pointer, walks to a table that does not
++ * exist and faults.  That was the whole probe-12 failure.
++ */
++#define SM_LPAE_TABLE_DESC  0x003u	/* pointer to the next table */
++#define SM_LPAE_LEAF_DESC   0x001u	/* block *or* page, any level */
++#define SM_LPAE_SH_OS       0x200u
++#define SM_LPAE_HAP_READ    0x040u
++#define SM_LPAE_HAP_WRITE   0x080u
++#define SM_MALI_BLOCK_2M    0x200000ull
++#define SM_GPU_PAGE_SIZE    0x1000u
++
++/* Job scheduler, from the shim's gpu.c. */
++#define SM_JOB_INT_RAWSTAT   0x1000u
++#define SM_JOB_INT_CLEAR     0x1004u
++#define SM_JOB_INT_MASK      0x1008u
++#define SM_JS_BASE           0x1800u
++#define SM_JS_SLOT_STRIDE    0x80u
++#define SM_JS_STATUS(js)           (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x24u)
++#define SM_JS_HEAD_NEXT_LO(js)     (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x40u)
++#define SM_JS_HEAD_NEXT_HI(js)     (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x44u)
++#define SM_JS_AFFINITY_NEXT_LO(js) (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x50u)
++#define SM_JS_AFFINITY_NEXT_HI(js) (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x54u)
++#define SM_JS_CONFIG_NEXT(js)      (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x58u)
++#define SM_JS_COMMAND_NEXT(js)     (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x60u)
++#define SM_JS_COMMAND(js)          (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x20u)
++#define SM_JS_HEAD_LO(js)          (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x00u)
++#define SM_JS_HEAD_HI(js)          (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x04u)
++#define SM_JS_TAIL_LO(js)          (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x08u)
++#define SM_JS_TAIL_HI(js)          (SM_JS_BASE + (js) * SM_JS_SLOT_STRIDE + 0x0cu)
++#define SM_JS_COMMAND_START   0x01u
++#define SM_JS_COMMAND_HARD_STOP 0x03u
++#define SM_JS_CONFIG_START_MMU (1u << 10)
++#define SM_JS_CONFIG_PRI_8    (8u << 16)
++#define SM_JS_CONFIG_FLUSH_BOTH 0x00003300u
++#define SM_JS_CONFIG_BASE     (SM_JS_CONFIG_PRI_8 | SM_JS_CONFIG_FLUSH_BOTH)
++#define SM_JOB_TYPE_WRITE_VALUE 2u
++#define SM_WRITE_VALUE_IMM64    7u
++
++/* Real panel framebuffer, same physical memory the XNU fbcon uses. */
++#define SM_PANEL_FB_PA     0xFDFFF000ull
++#define SM_PANEL_W         1080u
++#define SM_PANEL_H         2436u
++#define SM_PANEL_STRIDE    4352u
++#define SM_PANEL_BYTES     (SM_PANEL_STRIDE * 2436ull)
++#define SM_TILER_HEAP_SIZE 0x02000000ull
++#define SM_TILER_HEAP_ZERO 0x00400000ull
++#define SM_TRI_DS_OFF      0x0fc0u
++
++/* The shim's compact triangle descriptor layout inside one 4 KiB block. */
++enum {
++	SM_TRI_FRAG   = 0x000,
++	SM_TRI_FBD    = 0x100,
++	SM_TRI_RT     = 0x180,
++	SM_TRI_HEAP   = 0x200,
++	SM_TRI_TCTX   = 0x240,
++	SM_TRI_VSPD   = 0x300,
++	SM_TRI_FSPD   = 0x320,
++	SM_TRI_BLND   = 0x340,
++	SM_TRI_VSCODE = 0x400,
++	SM_TRI_FSCODE = 0x500,
++	SM_TRI_VJOB   = 0x800,
++	SM_TRI_CFLUSH = 0xc00,
++	SM_TRI_INDICES = 0xd00,
++	SM_TRI_RES    = 0x040,
++	SM_TRI_ATTR   = 0x600,	/* ATTRIBUTE descriptor (32 B) */
++	SM_TRI_ATTRBUF = 0x680,	/* BUFFER descriptor table (3 x 32 B) */
++	SM_TRI_VBUF   = 0x700,	/* vertex data, 3 x 16 B per block */
++	SM_TRI_VBLK   = 0x40,	/* spacing between vertex blocks */
++};
++
++#define SM_TIMEOUT_STEPS 100000u
++#define SM_TIMEOUT_US    10u
++
++/*
++ * Mali pixel format for one per-vertex R32G32B32A32_FLOAT attribute:
++ * MALI_PACK_FMT(RGBA32F, RGBA, L) == (191 << 12) | swizzle(0) | srgb(0).
++ * Mesa never stores the bare format index in a descriptor: "Format" fields
++ * (ATTRIBUTE, VARYING, render target conversion, ...) are 22-bit pixel
++ * formats whose index lives at bit 12 (see MALI_EXTRACT_INDEX and
++ * pan_special_format's "format << 12").
++ */
++#define SM_ATTR_PIXFMT   (191u << 12)	/* RGBA32F, swizzle RGBA */
++
++/* Format variants selectable per case through vbi bits 12..15. */
++#define SM_FMT_RGBA32F   0u	/* 191 << 12, the correct encoding */
++#define SM_FMT_SNAP4     1u	/* 94 << 12: RGBA32F + snap 2^-8 */
++#define SM_FMT_BARE      2u	/* 191: bare index (the old encoding) */
++#define SM_FMT_ZERO      3u	/* 0: unassigned format entry */
++
++/*
++ * Custom (non-identity) GPU virtual address window.  The Mali page tables
++ * are three levels of 512 entries: PGD covers VA 47:39, PUD 38:30 and PMD
++ * 29:21, where a PMD entry may be a 2 MiB block.  Everything the pipeline
++ * touches (descriptor page, tiler heap, panel framebuffer) is mapped a
++ * second time inside this window, so a case can hand the hardware an
++ * address that is *not* the physical address and prove the fetch really
++ * goes through the page table walk -- the prerequisite for BOs at
++ * arbitrary GPU VAs and for per-client isolation.
++ *
++ * SM_VA_BASE is 2^38: inside the first PGD entry's 512 GiB and far above
++ * every physical address this phone maps (all < 8 GiB), so a translated
++ * pointer can never accidentally hit an identity mapping.
++ */
++#define SM_VA_BASE    0x4000000000ull		/* 2^38, 2 MiB aligned */
++#define SM_VA_PUD_INDEX 256u	/* (SM_VA_BASE >> 30) & 0x1ff */
++#define SM_VA_PMD_PAGE  3u	/* tables page holding the window's PMDs */
++#define SM_VA_PTE_PAGE  4u	/* tables page holding the 4 KiB PTEs */
++#define SM_TABLES_PAGES 5u	/* PGD, PUD, identity PMD, window PMD, PTE */
++#define SM_VAW_TRI    (SM_VA_BASE + 0x00000000ull)
++#define SM_VAW_HEAP   (SM_VA_BASE + 0x04000000ull)	/* +64 MiB */
++#define SM_VAW_FB     (SM_VA_BASE + 0x20000000ull)	/* +512 MiB */
++/*
++ * 4 KiB window: PMD index 128 (+256 MiB) is unused by the block windows, so
++ * that entry can be a *table* pointer to page 4 and the tri page then lives
++ * there one 4 KiB page at a time -- with every neighbouring page unmapped,
++ * which is what makes the granularity observable.
++ */
++#define SM_VAW4K      (SM_VA_BASE + 0x10000000ull)	/* +256 MiB */
++#define SM_VA_PMD4K_INDEX 128u	/* (SM_VAW4K >> 21) & 0x1ff */
++
++/*
++ * Stage A3/B1: a real GPU VA allocator and a BO allocator.
++ *
++ * A3 -- the area is a 256 MiB slice of the same PGD entry the window uses,
++ * reached through its own PUD entry (258), so nothing it does can disturb
++ * the identity maps, the window or the 4 KiB window.  A 4 KiB-granular
++ * bitmap hands out first-fit contiguous ranges, and the *table* pages (one
++ * PMD page for the area, one PTE page per 2 MiB PMD entry) are taken from a
++ * pool on first touch and zeroed then -- nothing is preallocated, which is
++ * the difference between this and sm_pt_build()'s fixed windows.
++ *
++ * B1 -- a BO is one contiguous physical allocation handed out as a small
++ * handle (an index into a table) and mapped at a VA the allocator chose:
++ * create -> map -> fill -> submit -> unmap -> destroy, the whole lifecycle a
++ * GEM object needs.
++ */
++#define SM_VA_AREA_BASE   (SM_VA_BASE + 0x80000000ull)	/* +2 GiB */
++#define SM_VA_AREA_PUD_INDEX 258u	/* (SM_VA_AREA_BASE >> 30) & 0x1ff */
++#define SM_VA_AREA_SIZE   (256ull << 20)
++#define SM_VA_AREA_PAGES  ((uint32_t)(SM_VA_AREA_SIZE / SM_GPU_PAGE_SIZE))
++#define SM_VA_BITMAP_WORDS ((SM_VA_AREA_PAGES + 31u) / 32u)
++#define SM_VA_GUARD_OFF   0x400000ull	/* area + 4 MiB: never allocated */
++#define SM_TABLE_POOL_PAGES 16u	/* PMD/PTE pages for the area */
++#define SM_TABLES_TOTAL_PAGES (SM_TABLES_PAGES + SM_TABLE_POOL_PAGES)
++#define SM_BO_MAX 4u
++
++/* Which pointers of a batch use the custom VA instead of the PA. */
++#define SM_VA_CODE    0x01u	/* shader code (vspd/fspd word 2..3) */
++#define SM_VA_DESC    0x02u	/* job descriptor pointers, tctx, fbd, tls */
++#define SM_VA_TBL     0x04u	/* resource table entries (attr/buf tables) */
++#define SM_VA_VTX     0x08u	/* vertex buffer descriptor address */
++#define SM_VA_HEAP    0x10u	/* tiler heap data pointers (heap words 2..7) */
++#define SM_VA_FB      0x20u	/* render target base address */
++#define SM_VA_ALL     0x3fu
++/*
++ * Probe 11's "rt-shift" (render target 8 MiB inside the panel) proved that
++ * rt[8]/[9] really is the writeback address -- the writeback ran off the end
++ * of the mapped panel and latched a real MMU fault at 0xfec00500 (status
++ * a003c2).  It also wedged fragment JS0 for the rest of the boot and left
++ * stripes in panel memory the OS never repaints, so the case is gone; the
++ * evidence is in the log and in section 17 of HANDOFF.md.
++ *
++ * 4 KiB pages (stage A2): the same tri page is mapped page-granular so the
++ * mapping itself can be told apart from a 2 MiB block.
++ */
++#define SM_VA_4K      0x80u	/* tri page through the 4 KiB mapping */
++#define SM_VA_NEIGH   0x100u	/* negative control: shader code one 4 KiB page further */
++/*
++ * The mapping itself, not a pointer that uses it: the free/reuse cycle a BO
++ * needs.  Each is the 4 KiB case plus one edit of the PTE, made just before
++ * the batch runs.
++ */
++#define SM_VA_4K_UNMAP 0x200u	/* clear the PTE, then FLUSH_PT */
++#define SM_VA_4K_ZERO  0x400u	/* PTE -> a page of zeros (mapped, not code) */
++#define SM_VA_4K_CODE  0x800u	/* PTE -> the code page again */
++/*
++ * A4: run the batch in the second address space.  kbase's
++ * kbase_job_hw_submit() puts the AS number in JS_CONFIG (`cfg = (u32)
++ * kctx->as_nr;`), so "which AS" is four bits of the job-slot config and
++ * nothing else; the pointers of the batch do not change at all.
++ */
++#define SM_VA_AS1     0x1000u
++/*
++ * A3/B1: the batch's page-internal pointers use a VA the *allocator* handed
++ * out (the BO's own mapping) instead of the fixed window, and the guard
++ * cases name a VA inside the area that was never allocated -- so the fetch
++ * must be refused.  Which BO the case names is itself the variable, because
++ * two different BOs have two different VAs, and "the same VA again" after a
++ * free is how first-fit reuse is observed.
++ */
++#define SM_VA_BO0     0x2000u
++#define SM_VA_BO1     0x4000u
++#define SM_VA_BO2     0x8000u
++#define SM_VA_GUARD   0x10000u
++#define SM_VA_UNMAPPED 0x20000u	/* the MMU must refuse this fetch */
++
++/* BO lifecycle actions, run before the batch (see sm_case_action()). */
++#define SM_ACT_NONE     0u
++#define SM_ACT_BO0      1u	/* open BO0 (create + map) */
++#define SM_ACT_BO1      2u	/* open BO1, a 2 MiB BO */
++#define SM_ACT_BO0_FREE 3u	/* unmap + destroy BO0 */
++#define SM_ACT_BO2      4u	/* open BO2 after BO0 was freed */
++#define SM_ACT_BO_FIN   5u	/* tear what is left down */
++
++/*
++ * C1: which shader pair a case packs its descriptors from.  NONE means the
++ * boot-built panel pair, so every case before this patch behaves as it did.
++ */
++#define SM_SH_NONE        0u	/* the boot-built panel VS + panel FS */
++#define SM_SH_FS_BLUE     1u	/* panel VS + the new fragment shader */
++#define SM_SH_VS_OFF      2u	/* the new moved VS + the new FS */
++#define SM_SH_FS_BADSTAGE 3u	/* the new FS labelled as a vertex shader */
++
++/*
++ * C1: what the three pixel probes must show when the shader is the thing
++ * under test.  0 is the original "painted inside, black outside" test.
++ * The new fragment shader's colour is not written down anywhere: the case
++ * that runs it records what it produced and the cases after it only have to
++ * agree with that, plus differ from the panel colour the whole suite has
++ * been reading back since probe 9 (0xff00ff00).  That keeps the test about
++ * "a different shader ran" instead of about this driver's byte order.
++ */
++#define SM_PX_OLD   0u	/* the original test */
++#define SM_PX_NEW   1u	/* both inside probes = the new colour, outside clear */
++#define SM_PX_OFF   2u	/* inside probes clear, outside probe = the new colour */
++
++#define SM_PX_PANEL 0xff00ff00u	/* what the panel FS paints */
++#define SM_PX_CLEAR 0xff000000u	/* the job's opaque black clear */
++#define SM_PX_POISON 0xdeadbeefu	/* written by the harness, never by a job */
++
++/*
++ * B1: one BO.  The handle handed out is the index into sm.bo[], the same
++ * shape a GEM handle table has; `gpu_va` is 0 while the BO is not mapped.
++ */
++struct sm_bo {
++	vm_offset_t kva;
++	uint64_t pa;
++	uint64_t size;
++	uint64_t gpu_va;
++	boolean_t used;
++};
++
++static struct sweet_mali {
++	vm_offset_t gpu;
++	vm_offset_t mfg;
++	vm_offset_t scpsys;
++	vm_offset_t infra;
++	vm_offset_t top;
++	vm_offset_t apmixed;
++
++	uint32_t gpu_id;
++	uint32_t revision;
++	uint32_t l2_present;
++	uint32_t shader_present;
++	uint32_t tiler_present;
++	uint32_t as_present;
++	uint32_t js_present;
++	uint32_t mmu_features;
++	uint32_t mem_features;
++	uint32_t thread_features;
++	uint32_t coherency_features;
++	uint32_t max_threads;
++	uint32_t max_workgroup;
++	uint32_t max_barrier;
++
++	vm_offset_t tables;
++	uint64_t tables_pa;
++	/*
++	 * A second, independent page-table set for AS1 (stage A4): the same
++	 * identity maps and the same VA window, except that the one 4 KiB page
++	 * holds a page of zeros instead of the shader code.
++	 */
++	vm_offset_t as1_tables;
++	uint64_t as1_tables_pa;
++	vm_offset_t job;
++	uint64_t job_pa;
++	vm_offset_t target;
++	uint64_t target_pa;
++
++	/* Panel triangle: descriptor block, tiler heap, CPU view of the panel. */
++	vm_offset_t tri;
++	uint64_t tri_pa;
++	/*
++	 * A page of zeros, mapped through the 4 KiB window: a live PTE whose
++	 * contents are not code, so the fetch is mapped and still does not
++	 * draw -- which is how a mapping change is told apart from a fault.
++	 */
++	vm_offset_t zero;
++	uint64_t zero_pa;
++	vm_offset_t heap;
++	uint64_t heap_pa;
++	uint64_t heap_size;
++	vm_offset_t fb_map;
++
++	/*
++	 * A3: the area's own PMD page (NULL until the first mapping asks for
++	 * it) and the pool page counter -- the pool is the only source of
++	 * table pages for the area, so `pool_used` before/after a mapping is
++	 * the direct evidence that table pages were created lazily.
++	 */
++	uint64_t *area_pmd;
++	uint32_t pool_used;
++	/* A3: 4 KiB-granular allocation bitmap over the VA area. */
++	uint32_t va_used[SM_VA_BITMAP_WORDS];
++	/* B1: BO handle table. */
++	struct sm_bo bo[SM_BO_MAX];
++
++	boolean_t ready;
++	boolean_t started;
++} sm;
++
++/*
++ * The page-table set the mapping helpers write into, as (kVA, PA).  AS0 uses
++ * sm.tables; sm_pt_select(1) points it at the second set, which is how a
++ * second address space gets built and edited with exactly the same code.
++ */
++static uint64_t *sm_pt_tables;
++static uint64_t sm_pt_base;
++
++static void
++sm_pt_select(uint32_t as)
++{
++	if (as == 1u) {
++		sm_pt_tables = (uint64_t *)sm.as1_tables;
++		sm_pt_base = sm.as1_tables_pa;
++	} else {
++		sm_pt_tables = (uint64_t *)sm.tables;
++		sm_pt_base = sm.tables_pa;
++	}
++}
++
++static inline uint32_t
++sm_rd(vm_offset_t addr)
++{
++	uint32_t value = *(volatile uint32_t *)addr;
++	__asm__ volatile("dsb sy" ::: "memory");
++	return value;
++}
++
++static inline void
++sm_wr(vm_offset_t addr, uint32_t value)
++{
++	*(volatile uint32_t *)addr = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++sm_wait(vm_offset_t addr, uint32_t mask, uint32_t value)
++{
++	for (uint32_t i = 0; i < SM_TIMEOUT_STEPS; i++) {
++		if ((sm_rd(addr) & mask) == value) {
++			return 0;
++		}
++		delay(SM_TIMEOUT_US);
++	}
++	return -1;
++}
++
++static int
++sm_mtcmos_wait(uint32_t mask)
++{
++	for (uint32_t i = 0; i < SM_TIMEOUT_STEPS; i++) {
++		uint32_t s1 = sm_rd(sm.scpsys + SM_PWR_STATUS) & mask;
++		uint32_t s2 = sm_rd(sm.scpsys + SM_PWR_STATUS2) & mask;
++		if (s1 == mask && s2 == mask) {
++			return 0;
++		}
++		delay(SM_TIMEOUT_US);
++	}
++	return -1;
++}
++
++static int
++sm_mtcmos_on(uint32_t con_reg, uint32_t status_mask, const char *name)
++{
++	uint32_t con = sm_rd(sm.scpsys + con_reg);
++
++	sm_wr(sm.scpsys + con_reg, con | SM_PWR_ON);
++	con = sm_rd(sm.scpsys + con_reg);
++	sm_wr(sm.scpsys + con_reg, con | SM_PWR_ON_2ND);
++
++	if (sm_mtcmos_wait(status_mask)) {
++		printf("SWEETMALI: %s power timeout CON=%x STA=%x/%x\n",
++		    name, sm_rd(sm.scpsys + con_reg),
++		    sm_rd(sm.scpsys + SM_PWR_STATUS),
++		    sm_rd(sm.scpsys + SM_PWR_STATUS2));
++		return -1;
++	}
++	delay(100);
++
++	con = sm_rd(sm.scpsys + con_reg);
++	sm_wr(sm.scpsys + con_reg, con & ~SM_PWR_CLK_DIS);
++	con = sm_rd(sm.scpsys + con_reg);
++	sm_wr(sm.scpsys + con_reg, con & ~SM_PWR_ISO);
++	con = sm_rd(sm.scpsys + con_reg);
++	sm_wr(sm.scpsys + con_reg, con | SM_PWR_RST_B);
++	con = sm_rd(sm.scpsys + con_reg);
++	sm_wr(sm.scpsys + con_reg, con & ~SM_SRAM_PDN);
++
++	for (uint32_t i = 0; i < SM_TIMEOUT_STEPS; i++) {
++		if (!(sm_rd(sm.scpsys + con_reg) & SM_SRAM_PDN_ACK)) {
++			break;
++		}
++		delay(SM_TIMEOUT_US);
++	}
++	printf("SWEETMALI: %s on CON=%x STA=%x/%x\n", name,
++	    sm_rd(sm.scpsys + con_reg),
++	    sm_rd(sm.scpsys + SM_PWR_STATUS),
++	    sm_rd(sm.scpsys + SM_PWR_STATUS2));
++	return 0;
++}
++
++static void
++sm_mfg1_clear_protection(void)
++{
++	sm_wr(sm.infra + SM_PROTECTEN_2_CLR, SM_PROT_STEP2_1);
++	sm_wr(sm.infra + SM_PROTECTEN_CLR, SM_PROT_STEP2_0);
++	sm_wr(sm.infra + SM_PROTECTEN_2_CLR, SM_PROT_STEP1_1);
++	sm_wr(sm.infra + SM_PROTECTEN_1_CLR, SM_PROT_STEP1_0);
++	printf("SWEETMALI: mfg1 protection clear STA=%x/%x/%x\n",
++	    sm_rd(sm.infra + SM_PROTECTSTA1),
++	    sm_rd(sm.infra + SM_PROTECTSTA1_1),
++	    sm_rd(sm.infra + SM_PROTECTSTA1_2));
++}
++
++/*
++ * MediaTek routes GPU traffic through the Accelerator Coherency Port by
++ * default.  The route is broken on this SoC and makes every job fault with
++ * DATA_INVALID_FAULT.  Bit 9 of INFRA_MFG_SLAVE_GALS_CTRL disables it; the
++ * downstream MT6789 gpufreq driver and the MT8192 ChromeOS kbase fix agree.
++ */
++static void
++sm_disable_acp(void)
++{
++	uint32_t val = sm_rd(sm.infra + SM_MFG_SLAVE_GALS_CTRL);
++
++	sm_wr(sm.infra + SM_MFG_SLAVE_GALS_CTRL, val | (1u << SM_DIS_MFG2ACP_BIT));
++	printf("SWEETMALI: ACP disabled INFRA_CTL=%x\n",
++	    sm_rd(sm.infra + SM_MFG_SLAVE_GALS_CTRL));
++}
++
++static int
++sm_ref_clock_on(void)
++{
++	/*
++	 * topckgen muxes are changed through the write-1-to-clear /
++	 * write-1-to-set pair, then the update bit; CLK_CFG_4 itself only
++	 * reports the current state.
++	 */
++	sm_wr(sm.top + SM_TOP_CLK_CFG_4_CLR,
++	    (0x3u << SM_TOP_MFG_REF_SHIFT) | SM_TOP_MFG_REF_GATE);
++	sm_wr(sm.top + SM_TOP_CLK_CFG_4_SET, 0u);
++	sm_wr(sm.top + SM_TOP_CLK_CFG_UPDATE, SM_TOP_MFG_UPDATE);
++	delay(20);
++
++	uint32_t cfg = sm_rd(sm.top + SM_TOP_CLK_CFG_4);
++	uint32_t ref = (cfg >> SM_TOP_MFG_REF_SHIFT) & 0x3u;
++
++	printf("SWEETMALI: mfg_ref_sel=%u CFG4=%x\n", ref, cfg);
++	if ((cfg & SM_TOP_MFG_REF_GATE) || (ref != 0u)) {
++		return -1;
++	}
++	return 0;
++}
++
++static int
++sm_pll_on(void)
++{
++	uint32_t con3 = sm_rd(sm.apmixed + SM_MFGPLL_CON3);
++
++	sm_wr(sm.apmixed + SM_MFGPLL_CON3, con3 | 1u);
++	delay(10);
++	con3 = sm_rd(sm.apmixed + SM_MFGPLL_CON3);
++	sm_wr(sm.apmixed + SM_MFGPLL_CON3, con3 & ~2u);
++	delay(10);
++
++	uint32_t con0 = sm_rd(sm.apmixed + SM_MFGPLL_CON0);
++	sm_wr(sm.apmixed + SM_MFGPLL_CON0, con0 | 1u);
++	delay(20);
++
++	uint64_t pcw = (((SM_GPU_CLOCK_KHZ / 100u) *
++	    (1u << SM_GPU_PLL_POSDIV)) << 14) / 26u;
++	pcw = (pcw + 5u) / 10u;
++	sm_wr(sm.apmixed + SM_MFGPLL_CON1,
++	    SM_MFGPLL_PCW_CHG | (SM_GPU_PLL_POSDIV << SM_MFGPLL_POSDIV_S) |
++	    (uint32_t)pcw);
++	delay(50);
++
++	printf("SWEETMALI: mfgpll %u kHz PCW=%x CON0=%x CON1=%x CON3=%x\n",
++	    SM_GPU_CLOCK_KHZ, (uint32_t)pcw,
++	    sm_rd(sm.apmixed + SM_MFGPLL_CON0),
++	    sm_rd(sm.apmixed + SM_MFGPLL_CON1),
++	    sm_rd(sm.apmixed + SM_MFGPLL_CON3));
++	return 0;
++}
++
++static void
++sm_external_gates_on(void)
++{
++	uint32_t val = sm_rd(sm.mfg + 0x20u);
++
++	sm_wr(sm.mfg + 0x20u,
++	    val | (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25));
++
++	val = sm_rd(sm.mfg + 0xb0u);
++	sm_wr(sm.mfg + 0xb0u, val & ~((1u << 10) | (1u << 9)));
++
++	val = sm_rd(sm.mfg + 0xb4u);
++	sm_wr(sm.mfg + 0xb4u, val | (1u << 4));
++
++	val = sm_rd(sm.mfg + 0xb0u);
++	sm_wr(sm.mfg + 0xb0u, (val | (1u << 19)) & ~(1u << 8));
++
++	val = sm_rd(sm.mfg + 0x24u);
++	sm_wr(sm.mfg + 0x24u, val | 1u);
++
++	val = sm_rd(sm.mfg + 0xf60u);
++	sm_wr(sm.mfg + 0xf60u, val | 1u);
++}
++
++static int
++sm_main_clock_on(void)
++{
++	if (sm_pll_on()) {
++		return -1;
++	}
++
++	/* mfg_pll_sel is a width-1 mux at bit 18 with no update bit. */
++	sm_wr(sm.top + SM_TOP_CLK_CFG_4_CLR, SM_TOP_MFG_PLL_SEL);
++	sm_wr(sm.top + SM_TOP_CLK_CFG_4_SET, SM_TOP_MFG_PLL_SEL);
++	delay(10);
++	if (!(sm_rd(sm.top + SM_TOP_CLK_CFG_4) & SM_TOP_MFG_PLL_SEL)) {
++		printf("SWEETMALI: mfg_pll_sel did not latch (%x)\n",
++		    sm_rd(sm.top + SM_TOP_CLK_CFG_4));
++		return -2;
++	}
++
++	/*
++	 * mfgcfg_bg3d is a setclr gate: enabled reads back as status bit 0
++	 * being zero, and the clear register is what enables it.
++	 */
++	uint32_t before = sm_rd(sm.mfg + SM_MFG_BG3D_STA);
++	sm_wr(sm.mfg + SM_MFG_BG3D_CLR, SM_MFG_BG3D_BIT);
++	if (sm_wait(sm.mfg + SM_MFG_BG3D_STA, SM_MFG_BG3D_BIT, 0u)) {
++		printf("SWEETMALI: BG3D gate did not open (before=%x after=%x)\n",
++		    before, sm_rd(sm.mfg + SM_MFG_BG3D_STA));
++		return -3;
++	}
++
++	sm_external_gates_on();
++	printf("SWEETMALI: main clock on CFG4=%x MFG_STATUS=%x\n",
++	    sm_rd(sm.top + SM_TOP_CLK_CFG_4), sm_rd(sm.mfg + 0x00u));
++	return 0;
++}
++
++static int
++sm_power_and_clock(void)
++{
++	printf("SWEETMALI: power before STA=%x/%x CON=%x,%x,%x,%x\n",
++	    sm_rd(sm.scpsys + SM_PWR_STATUS),
++	    sm_rd(sm.scpsys + SM_PWR_STATUS2),
++	    sm_rd(sm.scpsys + SM_MFG0_PWR_CON),
++	    sm_rd(sm.scpsys + SM_MFG1_PWR_CON),
++	    sm_rd(sm.scpsys + SM_MFG2_PWR_CON),
++	    sm_rd(sm.scpsys + SM_MFG3_PWR_CON));
++
++	if (sm_mtcmos_on(SM_MFG0_PWR_CON, SM_MFG0_STA, "mfg0")) {
++		return -3;
++	}
++	if (sm_mtcmos_on(SM_MFG1_PWR_CON, SM_MFG1_STA, "mfg1")) {
++		return -4;
++	}
++	sm_mfg1_clear_protection();
++	if (sm_ref_clock_on()) {
++		printf("SWEETMALI: mfg_ref clock is gated\n");
++		return -2;
++	}
++	if (sm_mtcmos_on(SM_MFG2_PWR_CON, SM_MFG2_STA, "mfg2")) {
++		return -5;
++	}
++	if (sm_mtcmos_on(SM_MFG3_PWR_CON, SM_MFG3_STA, "mfg3")) {
++		return -6;
++	}
++
++	int rc = sm_main_clock_on();
++	if (rc) {
++		return rc;
++	}
++	printf("SWEETMALI: power after STA=%x/%x\n",
++	    sm_rd(sm.scpsys + SM_PWR_STATUS),
++	    sm_rd(sm.scpsys + SM_PWR_STATUS2));
++	return 0;
++}
++
++static int
++sm_soft_reset(void)
++{
++	sm_wr(sm.gpu + SM_GPU_INT_MASK, 0);
++	sm_wr(sm.gpu + SM_GPU_INT_CLEAR, SM_GPU_IRQ_RESET_COMPLETED);
++	sm_wr(sm.gpu + SM_GPU_CMD, SM_GPU_CMD_SOFT_RESET);
++
++	if (sm_wait(sm.gpu + SM_GPU_INT_RAWSTAT,
++	    SM_GPU_IRQ_RESET_COMPLETED, SM_GPU_IRQ_RESET_COMPLETED)) {
++		printf("SWEETMALI: soft reset timeout, trying hard reset\n");
++		sm_wr(sm.gpu + SM_GPU_CMD, SM_GPU_CMD_HARD_RESET);
++		if (sm_wait(sm.gpu + SM_GPU_INT_RAWSTAT,
++		    SM_GPU_IRQ_RESET_COMPLETED, SM_GPU_IRQ_RESET_COMPLETED)) {
++			printf("SWEETMALI: hard reset timeout RAWSTAT=%x STATUS=%x\n",
++			    sm_rd(sm.gpu + SM_GPU_INT_RAWSTAT),
++			    sm_rd(sm.gpu + SM_GPU_STATUS));
++			return -1;
++		}
++	}
++	sm_wr(sm.gpu + SM_GPU_INT_CLEAR, 0xffffffffu);
++	sm_wr(sm.gpu + SM_GPU_INT_MASK, 0);
++	printf("SWEETMALI: reset complete RAWSTAT=%x STATUS=%x\n",
++	    sm_rd(sm.gpu + SM_GPU_INT_RAWSTAT),
++	    sm_rd(sm.gpu + SM_GPU_STATUS));
++	return 0;
++}
++
++static void
++sm_read_features(void)
++{
++	uint32_t gpu_id = sm_rd(sm.gpu + SM_GPU_ID);
++
++	sm.gpu_id = gpu_id >> 16;
++	sm.revision = gpu_id & 0xffffu;
++	sm.l2_present = sm_rd(sm.gpu + SM_GPU_L2_PRESENT_LO);
++	sm.shader_present = sm_rd(sm.gpu + SM_GPU_SHADER_PRESENT_LO);
++	sm.tiler_present = sm_rd(sm.gpu + SM_GPU_TILER_PRESENT_LO);
++	sm.as_present = sm_rd(sm.gpu + SM_GPU_AS_PRESENT);
++	sm.js_present = sm_rd(sm.gpu + SM_GPU_JS_PRESENT);
++	sm.mmu_features = sm_rd(sm.gpu + SM_GPU_MMU_FEATURES);
++	sm.mem_features = sm_rd(sm.gpu + SM_GPU_MEM_FEATURES);
++	sm.thread_features = sm_rd(sm.gpu + SM_GPU_THREAD_FEATURES);
++	sm.coherency_features = sm_rd(sm.gpu + SM_GPU_COHERENCY_FEATURES);
++	sm.max_threads = sm_rd(sm.gpu + SM_GPU_THREAD_MAX_THREADS);
++	sm.max_workgroup = sm_rd(sm.gpu + SM_GPU_THREAD_MAX_WG);
++	sm.max_barrier = sm_rd(sm.gpu + SM_GPU_THREAD_MAX_BARRIER);
++
++	printf("SWEETMALI: ID=%x model=%x rev=%x\n", gpu_id,
++	    sm.gpu_id, sm.revision);
++	printf("SWEETMALI: L2=%x SHADER=%x TILER=%x STACK=%x\n",
++	    sm.l2_present, sm.shader_present, sm.tiler_present,
++	    sm_rd(sm.gpu + SM_GPU_STACK_PRESENT_LO));
++	printf("SWEETMALI: AS=%x JS=%x MMU=%x MEM=%x\n",
++	    sm.as_present, sm.js_present, sm.mmu_features, sm.mem_features);
++	printf("SWEETMALI: threads=%u wg=%u barrier=%u feat=%x coh=%x\n",
++	    sm.max_threads, sm.max_workgroup, sm.max_barrier,
++	    sm.thread_features, sm.coherency_features);
++	printf("SWEETMALI: L2_FEAT=%x CORE_FEAT=%x TILER_FEAT=%x AFBC=%x\n",
++	    sm_rd(sm.gpu + SM_GPU_L2_FEATURES),
++	    sm_rd(sm.gpu + SM_GPU_CORE_FEATURES),
++	    sm_rd(sm.gpu + SM_GPU_TILER_FEATURES),
++	    sm_rd(sm.gpu + SM_GPU_AFBC_FEATURES));
++	printf("SWEETMALI: texture=%x,%x,%x,%x JS_FEAT=%x,%x,%x,%x\n",
++	    sm_rd(sm.gpu + SM_GPU_TEXTURE_FEATURES(0)),
++	    sm_rd(sm.gpu + SM_GPU_TEXTURE_FEATURES(1)),
++	    sm_rd(sm.gpu + SM_GPU_TEXTURE_FEATURES(2)),
++	    sm_rd(sm.gpu + SM_GPU_TEXTURE_FEATURES(3)),
++	    sm_rd(sm.gpu + SM_GPU_JS_FEATURES(0)),
++	    sm_rd(sm.gpu + SM_GPU_JS_FEATURES(1)),
++	    sm_rd(sm.gpu + SM_GPU_JS_FEATURES(2)),
++	    sm_rd(sm.gpu + SM_GPU_JS_FEATURES(3)));
++	printf("SWEETMALI: TLS_ALLOC=%x\n",
++	    sm_rd(sm.gpu + SM_GPU_THREAD_TLS_ALLOC));
++}
++
++static void
++sm_apply_g57_quirks(void)
++{
++	/*
++	 * panfrost_model_cmp() folds the arch revision nibble away, so
++	 * MT6789's 0x9093 matches the 0x9003 G57 entry.  Apply the same
++	 * quirks the shim validated: SC_VAR_ALGORITHM and the default IDVS
++	 * group size.
++	 */
++	uint32_t model = sm.gpu_id;
++
++	if (model & 0xf000u) {
++		model &= 0xf00fu;
++	}
++	if ((model == 0x9001u) || (model == 0x9003u)) {
++		uint32_t shader = sm_rd(sm.gpu + SM_GPU_SHADER_CONFIG);
++
++		sm_wr(sm.gpu + SM_GPU_SHADER_CONFIG, SM_SC_VAR_ALGORITHM);
++		printf("SWEETMALI: SHADER_CONFIG %x -> %x\n", shader,
++		    sm_rd(sm.gpu + SM_GPU_SHADER_CONFIG));
++
++		uint32_t jm = sm_rd(sm.gpu + SM_GPU_JM_CONFIG);
++
++		sm_wr(sm.gpu + SM_GPU_JM_CONFIG, SM_JM_DEFAULT_IDVS_GROUP);
++		printf("SWEETMALI: JM_CONFIG %x -> %x\n", jm,
++		    sm_rd(sm.gpu + SM_GPU_JM_CONFIG));
++	}
++}
++
++static int
++sm_power_units_on(void)
++{
++	if (!sm.l2_present || !sm.shader_present || !sm.tiler_present) {
++		printf("SWEETMALI: impossible present map L2=%x SHADER=%x TILER=%x\n",
++		    sm.l2_present, sm.shader_present, sm.tiler_present);
++		return -1;
++	}
++
++	sm_wr(sm.gpu + SM_GPU_L2_PWRON_LO, sm.l2_present);
++	if (sm_wait(sm.gpu + SM_GPU_L2_READY_LO,
++	    sm.l2_present, sm.l2_present)) {
++		printf("SWEETMALI: L2 power timeout READY=%x\n",
++		    sm_rd(sm.gpu + SM_GPU_L2_READY_LO));
++		return -2;
++	}
++
++	sm_wr(sm.gpu + SM_GPU_SHADER_PWRON_LO, sm.shader_present);
++	if (sm_wait(sm.gpu + SM_GPU_SHADER_READY_LO,
++	    sm.shader_present, sm.shader_present)) {
++		printf("SWEETMALI: shader power timeout READY=%x\n",
++		    sm_rd(sm.gpu + SM_GPU_SHADER_READY_LO));
++		return -3;
++	}
++
++	sm_wr(sm.gpu + SM_GPU_TILER_PWRON_LO, sm.tiler_present);
++	if (sm_wait(sm.gpu + SM_GPU_TILER_READY_LO,
++	    sm.tiler_present, sm.tiler_present)) {
++		printf("SWEETMALI: tiler power timeout READY=%x\n",
++		    sm_rd(sm.gpu + SM_GPU_TILER_READY_LO));
++		return -4;
++	}
++
++	printf("SWEETMALI: ready L2=%x SHADER=%x TILER=%x\n",
++	    sm_rd(sm.gpu + SM_GPU_L2_READY_LO),
++	    sm_rd(sm.gpu + SM_GPU_SHADER_READY_LO),
++	    sm_rd(sm.gpu + SM_GPU_TILER_READY_LO));
++	return 0;
++}
++
++static uint64_t
++sm_page_table_desc(uint64_t pa)
++{
++	return (pa & ~0xfffull) | SM_LPAE_TABLE_DESC;
++}
++
++static uint64_t
++sm_page_block_desc(uint64_t pa)
++{
++	return (pa & ~(SM_MALI_BLOCK_2M - 1ull)) | SM_LPAE_LEAF_DESC |
++	    SM_LPAE_SH_OS | SM_LPAE_HAP_READ | SM_LPAE_HAP_WRITE;
++}
++
++/*
++ * A 4 KiB page descriptor differs from a 2 MiB block only in the address
++ * mask: the descriptor type is 0b01 for both (see the note on
++ * SM_LPAE_LEAF_DESC -- probe 12 used 0b11 here and the walk faulted).
++ */
++static uint64_t
++sm_page_desc(uint64_t pa)
++{
++	return (pa & ~0xfffull) | SM_LPAE_LEAF_DESC | SM_LPAE_SH_OS |
++	    SM_LPAE_HAP_READ | SM_LPAE_HAP_WRITE;
++}
++
++static void
++sm_cache_clean_invalidate(vm_offset_t addr, vm_size_t size)
++{
++	const vm_offset_t line = 64;
++	vm_offset_t start = addr & ~(line - 1);
++	vm_offset_t end = (addr + size + line - 1) & ~(line - 1);
++	vm_offset_t p;
++
++	for (p = start; p < end; p += line) {
++		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	__asm__ volatile("isb" ::: "memory");
++}
++
++/*
++ * Identity-map one naturally aligned 2 MiB block: IOVA == physical.  The
++ * descriptors must contain the physical addresses of the next-level tables,
++ * not their kernel virtual addresses.
++ */
++static void
++sm_map_2m(uint64_t pa)
++{
++	uint64_t base = pa & ~(SM_MALI_BLOCK_2M - 1ull);
++	uint32_t pgd_index = (uint32_t)((base >> 39) & 0x1ffull);
++	uint32_t pud_index = (uint32_t)((base >> 30) & 0x1ffull);
++	uint32_t pmd_index = (uint32_t)((base >> 21) & 0x1ffull);
++	uint64_t *tables = sm_pt_tables;
++
++	tables[pgd_index] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	tables[512 + pud_index] =
++	    sm_page_table_desc(sm_pt_base + 2ull * SM_GPU_PAGE_SIZE);
++	tables[1024 + pmd_index] = sm_page_block_desc(base);
++}
++
++/*
++ * All MMU commands and flushes take the address space explicitly: AS0 is the
++ * probe's own, AS1 is the second one A4 adds, and each has its own register
++ * block at SM_MMU_AS(as) with its own LOCKADDR/COMMAND/STATUS/FAULTSTATUS.
++ */
++static int
++sm_mmu_wait_ready(uint32_t as)
++{
++	for (uint32_t i = 0; i < SM_TIMEOUT_STEPS; i++) {
++		if (!(sm_rd(sm.gpu + SM_AS_STATUS(as)) &
++		    SM_AS_STATUS_AS_ACTIVE)) {
++			return 0;
++		}
++		delay(SM_TIMEOUT_US);
++	}
++	return -1;
++}
++
++static int
++sm_mmu_command(uint32_t as, uint32_t command)
++{
++	if (sm_mmu_wait_ready(as)) {
++		return -1;
++	}
++	sm_wr(sm.gpu + SM_AS_COMMAND(as), command);
++	return sm_mmu_wait_ready(as);
++}
++
++/*
++ * Highest set bit of x, 1-based (fls64); 0 for 0.
++ */
++static uint32_t
++sm_fls64(uint64_t x)
++{
++	uint32_t n = 0;
++
++	while (x) {
++		x >>= 1;
++		n++;
++	}
++	return n;
++}
++
++/*
++ * Invalidate the MMU's cached page-table walk for [va, va + size), so a PTE
++ * that was just changed is seen.  Exactly Panfrost's sequence: lock the
++ * region (AS_LOCKADDR = log2(size) - 1 | aligned start), AS_COMMAND_FLUSH_PT,
++ * then unlock.  Without it the MMU keeps translating through the entry it
++ * cached and an unmap appears to do nothing.
++ */
++static int
++sm_as_flush_pt(uint32_t as, uint64_t va, uint64_t size)
++{
++	uint32_t width;
++	uint64_t region;
++	int rc;
++
++	if (!size) {
++		return 0;
++	}
++	/* Highest bit in which start and end-1 differ: the smallest
++	 * naturally aligned block that covers the whole region. */
++	width = sm_fls64(va ^ (va + size - 1ull));
++	if (width < SM_AS_LOCK_MIN_LOG2) {
++		width = SM_AS_LOCK_MIN_LOG2;
++	}
++	width -= 1u;
++	region = (va & ~((1ull << width) - 1ull)) | (uint64_t)width;
++	sm_wr(sm.gpu + SM_AS_LOCKADDR_LO(as), (uint32_t)region);
++	sm_wr(sm.gpu + SM_AS_LOCKADDR_HI(as), (uint32_t)(region >> 32));
++	if (sm_mmu_command(as, SM_AS_COMMAND_LOCK)) {
++		return -1;
++	}
++	rc = sm_mmu_command(as, SM_AS_COMMAND_FLUSH_PT);
++	if (sm_mmu_command(as, SM_AS_COMMAND_UNLOCK)) {
++		return -3;
++	}
++	return rc;
++}
++
++static int
++sm_mmu_configure_as(uint32_t as, uint64_t pgd_pa)
++{
++	uint64_t transtab;
++
++	sm_wr(sm.gpu + SM_MMU_INT_MASK, 0);
++	sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
++
++	if (sm_mmu_wait_ready(as)) {
++		return -1;
++	}
++
++	/* Same lock/flush/update sequence as Panfrost and the shim. */
++	sm_wr(sm.gpu + SM_AS_LOCKADDR_LO(as), 63u);
++	sm_wr(sm.gpu + SM_AS_LOCKADDR_HI(as), 0);
++	if (sm_mmu_command(as, SM_AS_COMMAND_LOCK)) {
++		return -2;
++	}
++	if (sm_mmu_command(as, SM_AS_COMMAND_FLUSH_MEM)) {
++		return -3;
++	}
++
++	transtab = pgd_pa | SM_AS_TRANSTAB_MODE_TABLE |
++	    SM_AS_TRANSTAB_READ_INNER;
++	sm_wr(sm.gpu + SM_AS_TRANSTAB_LO(as), (uint32_t)transtab);
++	sm_wr(sm.gpu + SM_AS_TRANSTAB_HI(as), (uint32_t)(transtab >> 32));
++	sm_wr(sm.gpu + SM_AS_MEMATTR_LO(as), SM_MALI_MEMATTR);
++	sm_wr(sm.gpu + SM_AS_MEMATTR_HI(as), 0);
++	if (sm_mmu_command(as, SM_AS_COMMAND_UPDATE)) {
++		return -4;
++	}
++
++	printf("SWEETMALI: MMU AS%u TT=%x%x STATUS=%x MEMATTR=%x\n", as,
++	    sm_rd(sm.gpu + SM_AS_TRANSTAB_HI(as)),
++	    sm_rd(sm.gpu + SM_AS_TRANSTAB_LO(as)),
++	    sm_rd(sm.gpu + SM_AS_STATUS(as)),
++	    sm_rd(sm.gpu + SM_AS_MEMATTR_LO(as)));
++	return 0;
++}
++
++/*
++ * Contiguous kernel allocation with a known physical address.  Passing NULL
++ * as IOMallocContiguous' physicalAddress argument takes the unrestricted
++ * kmem_alloc_contig path (the deprecated physicalAddress form builds a 32-bit
++ * physical mask, which fails here because free DRAM lives above 4 GiB).
++ */
++static vm_offset_t
++sm_alloc_contig(vm_size_t size, vm_size_t alignment, uint64_t *pa)
++{
++	void *kva;
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++	kva = IOMallocContiguous(size, alignment, NULL);
++#pragma clang diagnostic pop
++
++	if (!kva) {
++		*pa = 0;
++		return 0;
++	}
++	*pa = (uint64_t)ml_vtophys((vm_offset_t)kva);
++	return (vm_offset_t)kva;
++}
++
++static int
++sm_mmu_alloc(void)
++{
++	uint64_t heap_size = SM_TILER_HEAP_SIZE;
++	int attempt;
++
++	sm.tables = sm_alloc_contig(SM_TABLES_TOTAL_PAGES * SM_GPU_PAGE_SIZE,
++	    SM_GPU_PAGE_SIZE, &sm.tables_pa);
++	sm.as1_tables = sm_alloc_contig(SM_TABLES_PAGES * SM_GPU_PAGE_SIZE,
++	    SM_GPU_PAGE_SIZE, &sm.as1_tables_pa);
++	sm.job = sm_alloc_contig(SM_GPU_PAGE_SIZE, SM_GPU_PAGE_SIZE,
++	    &sm.job_pa);
++	sm.target = sm_alloc_contig(SM_GPU_PAGE_SIZE, SM_GPU_PAGE_SIZE,
++	    &sm.target_pa);
++	sm.tri = sm_alloc_contig(SM_GPU_PAGE_SIZE, SM_GPU_PAGE_SIZE,
++	    &sm.tri_pa);
++	sm.zero = sm_alloc_contig(SM_GPU_PAGE_SIZE, SM_GPU_PAGE_SIZE,
++	    &sm.zero_pa);
++	if (sm.zero) {
++		volatile uint32_t *zp = (volatile uint32_t *)sm.zero;
++
++		for (attempt = 0; attempt < (int)(SM_GPU_PAGE_SIZE / 4u);
++		    attempt++) {
++			zp[attempt] = 0;
++		}
++		sm_cache_clean_invalidate(sm.zero, SM_GPU_PAGE_SIZE);
++	}
++
++	/*
++	 * Tiler heap: try progressively smaller physically contiguous blocks.
++	 * A page-aligned block is what upstream allocates; 32 MiB is the size
++	 * the shim proved.  The chunk enum in the heap descriptor is derived
++	 * from the size that actually succeeded.
++	 */
++	sm.heap = 0;
++	sm.heap_pa = 0;
++	for (attempt = 0; attempt < 4; attempt++) {
++		sm.heap = sm_alloc_contig((vm_size_t)heap_size,
++		    SM_GPU_PAGE_SIZE, &sm.heap_pa);
++		if (sm.heap) {
++			break;
++		}
++		heap_size >>= 2;
++	}
++	sm.heap_size = heap_size;
++
++	if (!sm.tables || !sm.as1_tables || !sm.job || !sm.target || !sm.tri ||
++	    !sm.heap || !sm.zero) {
++		printf("SWEETMALI: DMA alloc failed tables=%lx as1=%lx job=%lx "
++		    "target=%lx tri=%lx heap=%lx zero=%lx\n", sm.tables,
++		    sm.as1_tables, sm.job, sm.target, sm.tri, sm.heap, sm.zero);
++		return -1;
++	}
++
++	/*
++	 * The kernel's io_submap is only 8 MiB, far smaller than the panel
++	 * framebuffer.  Map just the first page here (poison marker); pixel
++	 * pages are mapped on demand in sm_fb_read_pixel().
++	 */
++	sm.fb_map = ml_io_map((vm_offset_t)SM_PANEL_FB_PA, SM_GPU_PAGE_SIZE);
++	if (!sm.fb_map) {
++		printf("SWEETMALI: panel fb map failed\n");
++		return -1;
++	}
++
++	printf("SWEETMALI: DMA tables=%lx/%llx job=%lx/%llx target=%lx/%llx\n",
++	    sm.tables, sm.tables_pa, sm.job, sm.job_pa, sm.target, sm.target_pa);
++	printf("SWEETMALI: DMA tri=%lx/%llx heap=%lx/%llx size=%llx fb=%lx\n",
++	    sm.tri, sm.tri_pa, sm.heap, sm.heap_pa, sm.heap_size, sm.fb_map);
++	return 0;
++}
++
++static void
++sm_map_range(uint64_t start, uint64_t end)
++{
++	uint64_t pa;
++
++	for (pa = start & ~(SM_MALI_BLOCK_2M - 1ull); pa < end;
++	    pa += SM_MALI_BLOCK_2M) {
++		sm_map_2m(pa);
++	}
++}
++
++/*
++ * Map one 2 MiB physical block at an arbitrary 2 MiB aligned VA.  Both the
++ * VA and the PA are aligned down, so the offset of a byte inside its block
++ * is preserved and "VA of X == va + (pa(X) & (2 MiB - 1))" holds.
++ *
++ * The window must *not* share the identity maps' PMD table.  A PMD entry is
++ * selected by VA bits 29:21 alone, so a shared table would silently make the
++ * two mappings overwrite each other's 2 MiB blocks -- exactly the probe-10
++ * failure, where the heap window landed on the heap's own identity entries
++ * and sent every later identity fetch 8 MiB off.  The window therefore owns
++ * tables page 3 and is reached through its own PUD entry (the identity maps
++ * only ever use PUD 0..7, since every PA here is below 8 GiB).
++ */
++static void
++sm_map_2m_at(uint64_t va, uint64_t pa)
++{
++	uint64_t vbase = va & ~(SM_MALI_BLOCK_2M - 1ull);
++	uint64_t pbase = pa & ~(SM_MALI_BLOCK_2M - 1ull);
++	uint32_t pgd_index = (uint32_t)((vbase >> 39) & 0x1ffull);
++	uint32_t pud_index = (uint32_t)((vbase >> 30) & 0x1ffull);
++	uint32_t pmd_index = (uint32_t)((vbase >> 21) & 0x1ffull);
++	uint64_t *tables = sm_pt_tables;
++	uint64_t *pmd = &tables[SM_VA_PMD_PAGE * 512u];
++
++	if (pud_index != SM_VA_PUD_INDEX) {
++		printf("SWEETMALI: VA %llx outside the window's PUD (%u)\n",
++		    (unsigned long long)va, pud_index);
++		return;
++	}
++	tables[pgd_index] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	tables[512 + pud_index] = sm_page_table_desc(
++	    sm_pt_base + (uint64_t)SM_VA_PMD_PAGE * SM_GPU_PAGE_SIZE);
++	pmd[pmd_index] = sm_page_block_desc(pbase);
++}
++
++/*
++ * Map [pa, pa + bytes) a second time starting at the 2 MiB aligned VA
++ * "va".  The caller must pass an aligned va; every byte keeps its offset
++ * inside its own block, so a buffer at pa + k lives at va + off + k.
++ */
++static void
++sm_map_range_at(uint64_t va, uint64_t pa, uint64_t bytes)
++{
++	uint64_t off = pa & (SM_MALI_BLOCK_2M - 1ull);
++	uint64_t pbase = pa - off;
++	uint64_t x;
++
++	for (x = 0; x < bytes + off; x += SM_MALI_BLOCK_2M) {
++		sm_map_2m_at(va + x, pbase + x);
++	}
++}
++
++/*
++ * Map one 4 KiB page at an arbitrary 4 KiB aligned VA, using the window's
++ * dedicated PTE table (tables page 4) reached through PMD entry
++ * SM_VA_PMD4K_INDEX.  No neighbouring page is mapped, so a read of the next
++ * page faults instead of silently hitting another page of the same block --
++ * that is what proves the walk really stopped at 4 KiB granularity rather
++ * than rounding out to a 2 MiB block.
++ */
++static void
++sm_map_4k_at(uint64_t va, uint64_t pa)
++{
++	uint32_t pgd_index = (uint32_t)((va >> 39) & 0x1ffull);
++	uint32_t pud_index = (uint32_t)((va >> 30) & 0x1ffull);
++	uint32_t pmd_index = (uint32_t)((va >> 21) & 0x1ffull);
++	uint32_t pte_index = (uint32_t)((va >> 12) & 0x1ffull);
++	uint64_t *tables = sm_pt_tables;
++	uint64_t *pmd = &tables[SM_VA_PMD_PAGE * 512u];
++	uint64_t *pte = &tables[SM_VA_PTE_PAGE * 512u];
++
++	if (pud_index != SM_VA_PUD_INDEX || pmd_index != SM_VA_PMD4K_INDEX) {
++		printf("SWEETMALI: VA %llx outside the 4K window (pud %u pmd "
++		    "%u)\n", (unsigned long long)va, pud_index, pmd_index);
++		return;
++	}
++	tables[pgd_index] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	tables[512 + pud_index] = sm_page_table_desc(
++	    sm_pt_base + (uint64_t)SM_VA_PMD_PAGE * SM_GPU_PAGE_SIZE);
++	pmd[pmd_index] = sm_page_table_desc(
++	    sm_pt_base + (uint64_t)SM_VA_PTE_PAGE * SM_GPU_PAGE_SIZE);
++	pte[pte_index] = sm_page_desc(pa);
++}
++
++/*
++ * Rewrite that one 4 KiB PTE and make the MMU drop the walk it cached for the
++ * page: pa == 0 unmaps, any other pa re-points it.  This is the BO lifecycle
++ * (map, unmap, map somewhere else) at the page level, and the flush is what
++ * makes it observable -- the case that follows an unmap has to fault.
++ */
++static int
++sm_pte4k_set(uint32_t as, uint64_t va, uint64_t pa)
++{
++	uint32_t pgd_index = (uint32_t)((va >> 39) & 0x1ffull);
++	uint32_t pud_index = (uint32_t)((va >> 30) & 0x1ffull);
++	uint32_t pmd_index = (uint32_t)((va >> 21) & 0x1ffull);
++	uint32_t pte_index = (uint32_t)((va >> 12) & 0x1ffull);
++	uint64_t *tables;
++	uint64_t *pmd;
++	uint64_t *pte;
++
++	if (pud_index != SM_VA_PUD_INDEX || pmd_index != SM_VA_PMD4K_INDEX) {
++		printf("SWEETMALI: PTE4K %llx outside the 4K window\n",
++		    (unsigned long long)va);
++		return -1;
++	}
++	sm_pt_select(as);
++	tables = sm_pt_tables;
++	pmd = &tables[SM_VA_PMD_PAGE * 512u];
++	pte = &tables[SM_VA_PTE_PAGE * 512u];
++	tables[pgd_index] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	tables[512 + pud_index] = sm_page_table_desc(
++	    sm_pt_base + (uint64_t)SM_VA_PMD_PAGE * SM_GPU_PAGE_SIZE);
++	pmd[pmd_index] = sm_page_table_desc(
++	    sm_pt_base + (uint64_t)SM_VA_PTE_PAGE * SM_GPU_PAGE_SIZE);
++	pte[pte_index] = pa ? sm_page_desc(pa) : 0ull;
++	sm_cache_clean_invalidate(sm_pt_tables,
++	    SM_TABLES_PAGES * SM_GPU_PAGE_SIZE);
++	return sm_as_flush_pt(as, va & ~0xfffull, SM_GPU_PAGE_SIZE);
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * A3: the GPU VA allocator and its table-page pool
++ * ---------------------------------------------------------------------------
++ * Everything here works on AS0's table set and only ever touches the area's
++ * own PUD entry (258), so the identity maps, the VA window and the 4 KiB
++ * window are structurally out of reach.
++ */
++
++/* PA of pool page `idx`; the pool is the tail of the one contiguous table
++ * allocation, so a PA inside it is an offset away from the kernel VA. */
++static uint64_t
++sm_pool_pa(uint32_t idx)
++{
++	return sm.tables_pa + (uint64_t)(SM_TABLES_PAGES + idx) *
++	    SM_GPU_PAGE_SIZE;
++}
++
++static uint64_t *
++sm_pt_at(uint64_t pa)
++{
++	return (uint64_t *)(sm.tables + (pa - sm.tables_pa));
++}
++
++/* Take one zeroed page from the pool.  Returns its pool index, or -1. */
++static int
++sm_pool_take(void)
++{
++	uint64_t *p;
++	uint32_t idx;
++
++	if (sm.pool_used >= SM_TABLE_POOL_PAGES) {
++		return -1;
++	}
++	idx = sm.pool_used++;
++	p = sm_pt_at(sm_pool_pa(idx));
++	for (uint32_t i = 0; i < 512u; i++) {
++		p[i] = 0;
++	}
++	sm_cache_clean_invalidate((vm_offset_t)p, SM_GPU_PAGE_SIZE);
++	return (int)idx;
++}
++
++/* The PTE page of one area PMD entry, created from the pool on first touch. */
++static uint64_t *
++sm_area_pte_page(uint32_t pmd_index)
++{
++	int idx;
++
++	if (!sm.area_pmd) {
++		idx = sm_pool_take();
++		if (idx < 0) {
++			return NULL;
++		}
++		sm.area_pmd = sm_pt_at(sm_pool_pa((uint32_t)idx));
++		sm_pt_tables[512 + SM_VA_AREA_PUD_INDEX] =
++		    sm_page_table_desc(sm_pool_pa((uint32_t)idx));
++	}
++	if ((sm.area_pmd[pmd_index] & 3ull) != SM_LPAE_TABLE_DESC) {
++		idx = sm_pool_take();
++		if (idx < 0) {
++			return NULL;
++		}
++		sm.area_pmd[pmd_index] =
++		    sm_page_table_desc(sm_pool_pa((uint32_t)idx));
++	}
++	return sm_pt_at(sm.area_pmd[pmd_index] & ~0xfffull);
++}
++
++/* First fit, contiguous, 4 KiB granular.  Returns the VA, or 0. */
++static uint64_t
++sm_va_alloc(uint32_t pages)
++{
++	uint32_t run = 0;
++
++	if (!pages || pages > SM_VA_AREA_PAGES) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < SM_VA_AREA_PAGES; i++) {
++		if (sm.va_used[i >> 5] & (1u << (i & 31u))) {
++			run = 0;
++			continue;
++		}
++		if (++run == pages) {
++			uint32_t first = i + 1u - pages;
++
++			for (uint32_t j = first; j <= i; j++) {
++				sm.va_used[j >> 5] |= 1u << (j & 31u);
++			}
++			return SM_VA_AREA_BASE +
++			    (uint64_t)first * SM_GPU_PAGE_SIZE;
++		}
++	}
++	return 0;
++}
++
++static void
++sm_va_free(uint64_t va, uint32_t pages)
++{
++	uint32_t first;
++
++	if (va < SM_VA_AREA_BASE) {
++		return;
++	}
++	first = (uint32_t)((va - SM_VA_AREA_BASE) / SM_GPU_PAGE_SIZE);
++	for (uint32_t j = 0; j < pages && first + j < SM_VA_AREA_PAGES; j++) {
++		sm.va_used[(first + j) >> 5] &= ~(1u << ((first + j) & 31u));
++	}
++}
++
++/*
++ * Map [pa, pa + size) at [va, va + size) with 4 KiB pages.  Unlike
++ * sm_pt_build()'s windows, whose tables exist because boot wrote them, here
++ * nothing exists until it is asked for: the area's PMD page and each PMD
++ * entry's PTE page come out of the pool zeroed at this moment, and the
++ * POOL counter is the evidence.
++ */
++static int
++sm_va_map_4k(uint64_t va, uint64_t pa, uint64_t size)
++{
++	uint64_t aligned = va & ~(SM_GPU_PAGE_SIZE - 1ull);
++	uint64_t pages = (size + SM_GPU_PAGE_SIZE - 1ull) / SM_GPU_PAGE_SIZE;
++
++	if (!aligned || ((aligned >> 39) & 0x1ffull) ||
++	    ((aligned >> 30) & 0x1ffull) != SM_VA_AREA_PUD_INDEX ||
++	    ((aligned + size - 1ull) >> 30 & 0x1ffull) !=
++	    SM_VA_AREA_PUD_INDEX) {
++		return -1;
++	}
++	sm_pt_select(0);
++	sm_pt_tables[0] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	for (uint64_t i = 0; i < pages; i++) {
++		uint64_t v = aligned + i * SM_GPU_PAGE_SIZE;
++		uint32_t pmd_index = (uint32_t)((v >> 21) & 0x1ffull);
++		uint32_t pte_index = (uint32_t)((v >> 12) & 0x1ffull);
++		uint64_t *pte = sm_area_pte_page(pmd_index);
++
++		if (!pte) {
++			return -2;
++		}
++		pte[pte_index] = sm_page_desc(pa + i * SM_GPU_PAGE_SIZE);
++	}
++	sm_cache_clean_invalidate(sm.tables,
++	    SM_TABLES_TOTAL_PAGES * SM_GPU_PAGE_SIZE);
++	return sm_as_flush_pt(0, aligned, pages * SM_GPU_PAGE_SIZE);
++}
++
++/*
++ * Clear the leaf entries of a mapping.  The table pages stay in the pool --
++ * a driver reclaims empty tables lazily -- but the FLUSH_PT is what makes
++ * the unmap visible, exactly as in sm_pte4k_set().
++ */
++static void
++sm_va_unmap(uint64_t va, uint64_t size)
++{
++	uint64_t aligned = va & ~(SM_GPU_PAGE_SIZE - 1ull);
++	uint64_t pages = (size + SM_GPU_PAGE_SIZE - 1ull) / SM_GPU_PAGE_SIZE;
++
++	if (!aligned || !sm.area_pmd) {
++		return;
++	}
++	sm_pt_select(0);
++	for (uint64_t i = 0; i < pages; i++) {
++		uint64_t v = aligned + i * SM_GPU_PAGE_SIZE;
++		uint32_t pmd_index = (uint32_t)((v >> 21) & 0x1ffull);
++		uint32_t pte_index = (uint32_t)((v >> 12) & 0x1ffull);
++
++		if ((sm.area_pmd[pmd_index] & 3ull) != SM_LPAE_TABLE_DESC) {
++			continue;
++		}
++		sm_pt_at(sm.area_pmd[pmd_index] & ~0xfffull)[pte_index] = 0;
++	}
++	sm_cache_clean_invalidate(sm.tables,
++	    SM_TABLES_TOTAL_PAGES * SM_GPU_PAGE_SIZE);
++	(void)sm_as_flush_pt(0, aligned, pages * SM_GPU_PAGE_SIZE);
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * B1: BO handles
++ * ---------------------------------------------------------------------------
++ */
++
++static void
++sm_bo_free_mem(vm_offset_t kva, uint64_t size)
++{
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++	IOFreeContiguous((void *)kva, (vm_size_t)size);
++#pragma clang diagnostic pop
++}
++
++/*
++ * Open a BO in `slot`: one contiguous physical allocation plus a VA the
++ * allocator picks and maps.  Idempotent, so a case can name an existing BO
++ * (that is how "the same VA works again later" is stated).
++ */
++static int
++sm_bo_open(uint32_t slot, uint64_t size)
++{
++	uint32_t pages = (uint32_t)((size + SM_GPU_PAGE_SIZE - 1ull) /
++	    SM_GPU_PAGE_SIZE);
++	uint64_t pa = 0;
++	uint64_t va;
++	vm_offset_t kva;
++
++	if (slot >= SM_BO_MAX) {
++		return -1;
++	}
++	if (sm.bo[slot].used) {
++		return 0;
++	}
++	kva = sm_alloc_contig((vm_size_t)size, SM_GPU_PAGE_SIZE, &pa);
++	if (!kva) {
++		return -2;
++	}
++	va = sm_va_alloc(pages);
++	if (!va) {
++		sm_bo_free_mem(kva, size);
++		return -3;
++	}
++	if (sm_va_map_4k(va, pa, size)) {
++		sm_va_free(va, pages);
++		sm_bo_free_mem(kva, size);
++		return -4;
++	}
++	sm.bo[slot].kva = kva;
++	sm.bo[slot].pa = pa;
++	sm.bo[slot].size = size;
++	sm.bo[slot].gpu_va = va;
++	sm.bo[slot].used = TRUE;
++	return 0;
++}
++
++/*
++ * Close a BO: unmap the VA first -- the PTE is cleared and the walk flushed,
++ * so nothing can still reach the memory -- and only then hand the physical
++ * allocation back.
++ */
++static void
++sm_bo_close(uint32_t slot)
++{
++	struct sm_bo *bo;
++
++	if (slot >= SM_BO_MAX) {
++		return;
++	}
++	bo = &sm.bo[slot];
++	if (!bo->used) {
++		return;
++	}
++	if (bo->gpu_va) {
++		sm_va_unmap(bo->gpu_va, bo->size);
++		sm_va_free(bo->gpu_va,
++		    (uint32_t)(bo->size / SM_GPU_PAGE_SIZE));
++		/*
++		 * The VA is *kept* in the handle: a case may name it after
++		 * the free to show that the address is now refused, and the
++		 * next open of this slot overwrites it.
++		 */
++	}
++	sm_bo_free_mem(bo->kva, bo->size);
++	bo->kva = 0;
++	bo->pa = 0;
++	bo->used = FALSE;
++}
++
++/* The BO's first page becomes a byte-exact copy of the descriptor page, so a
++ * batch whose pointers name the BO sees exactly what the page holds. */
++static void
++sm_bo_fill(uint32_t slot)
++{
++	const uint8_t *src = (const uint8_t *)sm.tri;
++	uint8_t *dst;
++
++	if (slot >= SM_BO_MAX || !sm.bo[slot].used) {
++		return;
++	}
++	dst = (uint8_t *)sm.bo[slot].kva;
++	for (uint32_t i = 0; i < SM_GPU_PAGE_SIZE; i++) {
++		dst[i] = src[i];
++	}
++	sm_cache_clean_invalidate(sm.bo[slot].kva, SM_GPU_PAGE_SIZE);
++}
++
++/* The VA a case names for the batch's page-internal pointers. */
++static uint64_t
++sm_case_va_base(uint32_t va_flags)
++{
++	if (va_flags & SM_VA_BO0) {
++		return sm.bo[0].gpu_va;
++	}
++	if (va_flags & SM_VA_BO1) {
++		return sm.bo[1].gpu_va;
++	}
++	if (va_flags & SM_VA_BO2) {
++		return sm.bo[2].gpu_va;
++	}
++	if (va_flags & SM_VA_GUARD) {
++		return SM_VA_AREA_BASE + SM_VA_GUARD_OFF;
++	}
++	return 0;
++}
++
++/*
++ * The A3/B1 lifecycle, driven from the case table rather than from code in
++ * the loop: each entry names one step, and every step logs the state it
++ * produced, so a failure belongs to a step and never to the batch.
++ */
++static int
++sm_case_action(uint32_t action, const char *name)
++{
++	int rc = 0;
++
++	switch (action) {
++	case SM_ACT_NONE:
++		return 0;
++	case SM_ACT_BO0:
++		rc = sm_bo_open(0, SM_GPU_PAGE_SIZE);
++		break;
++	case SM_ACT_BO1:
++		/*
++		 * Deliberately 2 MiB: it runs past the end of the first PMD
++		 * entry, so mapping it has to create a *second* PTE page.
++		 */
++		rc = sm_bo_open(1, 512ull * SM_GPU_PAGE_SIZE);
++		break;
++	case SM_ACT_BO0_FREE:
++		sm_bo_close(0);
++		break;
++	case SM_ACT_BO2:
++		rc = sm_bo_open(2, SM_GPU_PAGE_SIZE);
++		break;
++	case SM_ACT_BO_FIN:
++		sm_bo_close(1);
++		sm_bo_close(2);
++		break;
++	default:
++		rc = -1;
++		break;
++	}
++	printf("SWEETMALI: IDXB %s act=%u rc=%d bo0=%llx/%llx bo1=%llx/%llx "
++	    "bo2=%llx/%llx pool=%u/%u\n", name, action, rc,
++	    (unsigned long long)sm.bo[0].gpu_va,
++	    (unsigned long long)sm.bo[0].pa,
++	    (unsigned long long)sm.bo[1].gpu_va,
++	    (unsigned long long)sm.bo[1].pa,
++	    (unsigned long long)sm.bo[2].gpu_va,
++	    (unsigned long long)sm.bo[2].pa,
++	    sm.pool_used, SM_TABLE_POOL_PAGES);
++	return rc;
++}
++
++/*
++ * Build one complete page-table set: the identity maps for everything the
++ * probe touches, the VA window over the same memory, and the 4 KiB window
++ * over "page4k_pa".  AS0 gets the shader code page there, AS1 a page of
++ * zeros, so the two address spaces differ in exactly one PTE and nothing
++ * else -- which is what makes "this job really ran in AS1" observable.
++ */
++static void
++sm_pt_build(uint64_t page4k_pa)
++{
++	sm_map_2m(sm.tables_pa);
++	sm_map_2m(sm.as1_tables_pa);
++	sm_map_2m(sm.job_pa);
++	sm_map_2m(sm.target_pa);
++	sm_map_2m(sm.tri_pa);
++	sm_map_range(sm.heap_pa, sm.heap_pa + sm.heap_size);
++	sm_map_range(SM_PANEL_FB_PA, SM_PANEL_FB_PA + SM_PANEL_BYTES);
++
++	/*
++	 * The same memory a second time at a VA window that is *not* its
++	 * physical address.  A batch whose pointers use these addresses only
++	 * works if the hardware walks the page tables, which is what the BO
++	 * (and eventually multi-AS) support needs.
++	 */
++	sm_map_2m_at(SM_VAW_TRI, sm.tri_pa);
++	sm_map_range_at(SM_VAW_HEAP, sm.heap_pa, sm.heap_size);
++	sm_map_range_at(SM_VAW_FB, SM_PANEL_FB_PA, SM_PANEL_BYTES);
++	/*
++	 * And one page alone through the 4 KiB walk (PTE table page 4).  Its
++	 * neighbours stay unmapped, so a fetch that crosses the 4 KiB
++	 * boundary must fault instead of finding more of the block.
++	 */
++	sm_map_4k_at(SM_VAW4K + (page4k_pa & 0xfffull), page4k_pa);
++	__asm__ volatile("dsb sy" ::: "memory");
++	sm_cache_clean_invalidate(sm_pt_tables,
++	    SM_TABLES_PAGES * SM_GPU_PAGE_SIZE);
++}
++
++static void
++sm_pt_zero(void)
++{
++	uint64_t *tables = sm_pt_tables;
++
++	for (uint32_t i = 0; i < 512u * SM_TABLES_PAGES; i++) {
++		tables[i] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++sm_mmu_init(void)
++{
++	int rc;
++
++	rc = sm_mmu_alloc();
++	if (rc) {
++		return rc;
++	}
++
++	/* AS0: identity + window, and the code page in the 4 KiB window. */
++	sm_pt_select(0);
++	sm_pt_zero();
++	sm_pt_build(sm.tri_pa);
++
++	/* AS1: the same set, except a page of zeros in the 4 KiB window. */
++	sm_pt_select(1);
++	sm_pt_zero();
++	sm_pt_build(sm.zero_pa);
++
++	/*
++	 * A3: the allocator starts empty -- no VA handed out, no area PMD
++	 * page, no pool page used.  The softc is zeroed, but say it here so
++	 * the boot log states the initial condition the cases then change.
++	 */
++	sm.pool_used = 0;
++	sm.area_pmd = NULL;
++	sm_pt_select(0);
++	printf("SWEETMALI: A3 area=%llx size=%llx pages=%u pool=%u\n",
++	    (unsigned long long)SM_VA_AREA_BASE,
++	    (unsigned long long)SM_VA_AREA_SIZE, SM_VA_AREA_PAGES,
++	    SM_TABLE_POOL_PAGES);
++
++	/*
++	 * Boot-time proof that the identity maps (PMD table page 2) and the
++	 * custom window (page 3) are separate: an identity entry must still
++	 * point at its own block and the window entries at the blocks asked
++	 * for.  A collision would show up here as a wrong/missing pointer.
++	 */
++	{
++		const uint64_t *tb = (const uint64_t *)sm.tables;
++		const uint64_t *t1 = (const uint64_t *)sm.as1_tables;
++		uint32_t tri_pmd = (uint32_t)((sm.tri_pa >> 21) & 0x1ffull);
++		uint32_t heap_pmd = (uint32_t)((sm.heap_pa >> 21) & 0x1ffull);
++		uint32_t tri_pud = (uint32_t)((sm.tri_pa >> 30) & 0x1ffull);
++		uint64_t va4k = SM_VAW4K + (sm.tri_pa & 0xfffull);
++		uint32_t pte = (uint32_t)((va4k >> 12) & 0x1ffull);
++
++		printf("SWEETMALI: TBL idpud%u=%llx idpmd%u=%llx idpmd%u=%llx "
++		    "winpud%u=%llx win0=%llx win32=%llx win256=%llx\n",
++		    tri_pud, (unsigned long long)tb[512 + tri_pud],
++		    tri_pmd, (unsigned long long)tb[1024 + tri_pmd],
++		    heap_pmd, (unsigned long long)tb[1024 + heap_pmd],
++		    SM_VA_PUD_INDEX,
++		    (unsigned long long)tb[512 + SM_VA_PUD_INDEX],
++		    (unsigned long long)tb[SM_VA_PMD_PAGE * 512u],
++		    (unsigned long long)tb[SM_VA_PMD_PAGE * 512u + 32u],
++		    (unsigned long long)tb[SM_VA_PMD_PAGE * 512u + 256u]);
++		printf("SWEETMALI: TBL4K va=%llx pmd%u=%llx pte%u=%llx\n",
++		    (unsigned long long)va4k, SM_VA_PMD4K_INDEX,
++		    (unsigned long long)tb[SM_VA_PMD_PAGE * 512u +
++		    SM_VA_PMD4K_INDEX], pte,
++		    (unsigned long long)tb[SM_VA_PTE_PAGE * 512u + pte]);
++		/*
++		 * The same slot of the second address space, one PTE apart
++		 * from AS0: an identity entry must be byte-identical, the
++		 * 4 KiB entry must point somewhere else.
++		 */
++		printf("SWEETMALI: TBL4K1 va=%llx pmd%u=%llx pte%u=%llx "
++		    "idpmd%u=%llx\n", (unsigned long long)va4k,
++		    SM_VA_PMD4K_INDEX,
++		    (unsigned long long)t1[SM_VA_PMD_PAGE * 512u +
++		    SM_VA_PMD4K_INDEX], pte,
++		    (unsigned long long)t1[SM_VA_PTE_PAGE * 512u + pte],
++		    tri_pmd, (unsigned long long)t1[1024 + tri_pmd]);
++	}
++
++	rc = sm_mmu_configure_as(0, sm.tables_pa);
++	if (rc) {
++		printf("SWEETMALI: MMU AS0 setup failed rc=%d\n", -rc);
++		return rc;
++	}
++	rc = sm_mmu_configure_as(1, sm.as1_tables_pa);
++	if (rc) {
++		printf("SWEETMALI: MMU AS1 setup failed rc=%d\n", -rc);
++		return rc;
++	}
++	printf("SWEETMALI: MMU AS0 ready (identity 2 MiB blocks; VA window "
++	    "%llx: tri=%llx heap=%llx fb=%llx) AS1 page=%llx\n",
++	    (unsigned long long)SM_VA_BASE,
++	    (unsigned long long)(SM_VAW_TRI +
++	    (sm.tri_pa & (SM_MALI_BLOCK_2M - 1ull))),
++	    (unsigned long long)(SM_VAW_HEAP +
++	    (sm.heap_pa & (SM_MALI_BLOCK_2M - 1ull))),
++	    (unsigned long long)(SM_VAW_FB +
++	    (SM_PANEL_FB_PA & (SM_MALI_BLOCK_2M - 1ull))),
++	    (unsigned long long)sm.zero_pa);
++	return 0;
++}
++
++/*
++ * One write-value job through JS0 with START_MMU set.  The GPU fetches the
++ * descriptor and writes the immediate through AS0, so this proves both the
++ * job scheduler and the MMU.  The target starts at a sentinel that differs
++ * from the value the GPU writes.
++ */
++static int
++sm_write_value_test(void)
++{
++	volatile uint32_t *hdr = (volatile uint32_t *)sm.job;
++	uint64_t value = 0xa5a5a5a55a5a5a5aull;
++	uint64_t before = 0x1111222233334444ull;
++	uint64_t got;
++	uint32_t js = 0;
++	uint32_t status = 0;
++	uint32_t i;
++
++	for (i = 0; i < SM_GPU_PAGE_SIZE / 4u; i++) {
++		hdr[i] = 0;
++	}
++	hdr[4] = ((SM_JOB_TYPE_WRITE_VALUE & 0x7fu) << 1) | (1u << 16);
++	hdr[8] = (uint32_t)sm.target_pa;
++	hdr[9] = (uint32_t)(sm.target_pa >> 32);
++	hdr[10] = SM_WRITE_VALUE_IMM64 & 0x7u;
++	hdr[11] = 0;
++	hdr[12] = (uint32_t)value;
++	hdr[13] = (uint32_t)(value >> 32);
++	hdr[14] = 0;
++	hdr[15] = 0;
++
++	*(volatile uint64_t *)sm.target = before;
++	sm_cache_clean_invalidate(sm.job, SM_GPU_PAGE_SIZE);
++	sm_cache_clean_invalidate(sm.target, SM_GPU_PAGE_SIZE);
++
++	sm_wr(sm.gpu + SM_JOB_INT_MASK, 0);
++	sm_wr(sm.gpu + SM_JOB_INT_CLEAR, 0xffffffffu);
++	sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
++
++	sm_wr(sm.gpu + SM_JS_HEAD_NEXT_LO(js), (uint32_t)sm.job_pa);
++	sm_wr(sm.gpu + SM_JS_HEAD_NEXT_HI(js), (uint32_t)(sm.job_pa >> 32));
++	sm_wr(sm.gpu + SM_JS_AFFINITY_NEXT_LO(js), sm.shader_present);
++	sm_wr(sm.gpu + SM_JS_AFFINITY_NEXT_HI(js), 0);
++	sm_wr(sm.gpu + SM_JS_CONFIG_NEXT(js),
++	    SM_JS_CONFIG_BASE | SM_JS_CONFIG_START_MMU);
++	sm_wr(sm.gpu + SM_JS_COMMAND_NEXT(js), SM_JS_COMMAND_START);
++
++	for (i = 0; i < SM_TIMEOUT_STEPS; i++) {
++		status = sm_rd(sm.gpu + SM_JOB_INT_RAWSTAT);
++		if (status & ((1u << js) | (1u << (16u + js)))) {
++			break;
++		}
++		delay(SM_TIMEOUT_US);
++	}
++
++	printf("SWEETMALI: WV rawstat=%x js_status=%x mmu=%x\n", status,
++	    sm_rd(sm.gpu + SM_JS_STATUS(js)),
++	    sm_rd(sm.gpu + SM_MMU_INT_RAWSTAT));
++	if (status & (1u << (16u + js))) {
++		printf("SWEETMALI: WV FAULT status=%x addr=%x%x\n",
++		    sm_rd(sm.gpu + SM_AS_FAULTSTATUS(0)),
++		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_HI(0)),
++		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_LO(0)));
++	}
++	sm_wr(sm.gpu + SM_JOB_INT_CLEAR, status);
++	sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
++
++	sm_cache_clean_invalidate(sm.target, SM_GPU_PAGE_SIZE);
++	got = *(volatile uint64_t *)sm.target;
++
++	printf("SWEETMALI: WV value=%llx expected=%llx %s\n", got, value,
++	    (got == value) ? "PASS" : "FAIL");
++	return (got == value) ? 0 : -1;
++}
++
++/*
++ * Shader blobs from the shim (Mesa panfrost Valhall v9, generated once).
++ * 256-byte IDVS vertex shader, 128-byte constant-colour fragment shader.
++ */
++static const uint32_t sm_panel_vs_code[64] = {
++	0x9cc0c43cu, 0x00f0c000u, 0x070000c0u, 0x0110c143u,
++	0x6c4000c0u, 0x0110c244u, 0x4241c040u, 0x0150c000u,
++	0x98c0c87cu, 0x00f0c100u, 0x070000c0u, 0x0110c244u,
++	0x4240c001u, 0x0150c000u, 0x00000d7bu, 0x005e8204u,
++	0x053800c0u, 0x0110c445u, 0x984000c0u, 0x0110c543u,
++	0x4544c041u, 0x0150c100u, 0x00000040u, 0x0091c400u,
++	0x00000041u, 0x0091c500u, 0x000000c0u, 0x0091c600u,
++	0x000000d0u, 0x0891c700u, 0x00000042u, 0x0091c000u,
++	0x00000043u, 0x0091c100u, 0x79000040u, 0x78614408u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++};
++
++static const uint32_t sm_panel_fs_code[32] = {
++	0x800000c0u, 0x4110c13fu, 0x00ead07cu, 0x087dbc02u,
++	0x000000c0u, 0x6891c000u, 0x000000c0u, 0x0091c200u,
++	0x000000d0u, 0x4891c300u, 0x323c00f0u, 0x787f4008u,
++	0x000000c0u, 0x0110f000u, 0x0000f1c0u, 0x002fc110u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++};
++
++/*
++ * Vertex shader that fetches gl_Position from attribute 0 through the
++ * attribute table (LD_ATTR_IMM index 0, table 1).  128 bytes, generated by
++ * tools/pan_shad.c from a NIR VS that reads a vec4 input.
++ */
++static const uint32_t sm_vs_attr_code[64] = {
++	0x32017d7cu, 0x08668008u, 0x00000043u, 0x009cc300u, /*   0 */
++	0x000000c0u, 0x0110c4c7u, 0x00034443u, 0x00a4c300u, /*   4 */
++	0x000000c0u, 0x0110c447u, 0x00024443u, 0x00a4c300u, /*   8 */
++	0x00c00342u, 0x00b2c204u, 0x070000c0u, 0x0110c444u, /*  12 */
++	0x00c00440u, 0x00b2c004u, 0x00440340u, 0x00b2c000u, /*  16 */
++	0x984000c0u, 0x0110c4c4u, 0x00c04441u, 0x00b2c104u, /*  20 */
++	0x984000c0u, 0x0110c444u, 0x00440341u, 0x00b2c100u, /*  24 */
++	0x40000d7bu, 0x105e8404u, 0xb9000044u, 0x78614008u, /*  28 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  32 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  36 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  40 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  44 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  48 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  52 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  56 */
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, /*  60 */
++};
++
++/*
++ * C1: two shader blobs the kernel has never executed before, compiled by the
++ * same host tool (tools/pan_shad.c) with the same panel viewport.  They exist
++ * to be *evidence*: neither the driver nor the descriptor template knows
++ * anything about them, so their effect can only appear if the descriptor this
++ * driver packs really selected them.
++ *
++ * sm_fs_blue_code paints ARGB32 0xff0000ff (NIR constant (0,0,1,1)); the
++ * kernel's own fragment shader paints the panel colour instead.
++ *
++ * sm_vs_off_code is the raw-vertex-id triangle moved to window coordinates
++ * (col,row) (0,2314) (270,2314) (135,1949) -- the top-left corner of the
++ * panel -- instead of the panel triangle (135,2131) (945,2131) (540,304).
++ * Those coordinates are immediates in the code (verified in the tool's
++ * disassembly), so a pixel being painted at row 2300/col 60 and *not* at
++ * row 1000/col 540 is a direct statement about which vertex shader ran.
++ */
++static const uint32_t sm_fs_blue_code[32] = {
++	0x000000c0u, 0x4091c000u, 0x00ead07cu, 0x087dbc02u,
++	0x000000c0u, 0x6891c100u, 0x000000d0u, 0x0091c200u,
++	0x000000d0u, 0x4891c300u, 0x323c00f0u, 0x787f4008u,
++	0x000000c0u, 0x0110f000u, 0x0000f1c0u, 0x002fc110u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++};
++
++static const uint32_t sm_vs_off_code[64] = {
++	0x9cc0c43cu, 0x00f0c000u, 0x870000c0u, 0x0110c143u,
++	0x41c0c040u, 0x0150c000u, 0x98c0c87cu, 0x00f0c100u,
++	0x070000c0u, 0x0110c243u, 0x4240c001u, 0x0150c000u,
++	0x00000d7bu, 0x005e8204u, 0x10a333c0u, 0x0110c445u,
++	0xf3999ac0u, 0x0110c544u, 0x4544c041u, 0x0150c100u,
++	0x00000040u, 0x0091c400u, 0x00000041u, 0x0091c500u,
++	0x000000c0u, 0x0091c600u, 0x000000d0u, 0x0891c700u,
++	0x00000042u, 0x0091c000u, 0x00000043u, 0x0091c100u,
++	0x79000040u, 0x78614408u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++	0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
++};
++
++/*
++ * ---------------------------------------------------------------------------
++ * C1: the shader program descriptor, built from metadata
++ * ---------------------------------------------------------------------------
++ *
++ * Up to probe 16 every descriptor was four literals written next to the blob
++ * it described, so a blob and its descriptor could disagree without anything
++ * noticing -- and the compiler knows facts about a blob (how many registers
++ * it uses, which registers it preloads) that the hardware is told separately.
++ *
++ * This is the whole of what panfrost's pan_shader_info contributes to a
++ * Valhall Shader Program Descriptor, plus the stage the driver is compiling
++ * for.  It is what a user client would hand the kernel in stage D.
++ */
++struct sm_shader {
++	const uint32_t *code;
++	uint32_t words;
++	uint32_t work_reg_count;	/* pan_shader_info.work_reg_count */
++	uint64_t preload;		/* pan_shader_info.preload */
++	uint32_t stage;
++};
++
++#define SM_STAGE_VERTEX   0u
++#define SM_STAGE_FRAGMENT 1u
++
++/*
++ * Pack the 16-byte Valhall Shader Program Descriptor.  Field positions and
++ * enum values are Mesa's genxml/v9.xml <struct name="Shader Program">:
++ *
++ *   word0 [3:0]   descriptor type, 8 = Shader
++ *         [7:4]   stage, 2 = fragment, 3 = vertex
++ *         [8]     fragment coverage bitmask type, 1 = GL    (fragment)
++ *         [9:8]   vertex warp limit, 1 = half               (vertex)
++ *         [31:30] register allocation, 2 = 32/thread, 0 = 64/thread
++ *   word1 [15:0]  preload bitmap, bit (reg - 48) for registers r48..r63
++ *   word2..3      address of the code
++ *
++ * Both descriptors the driver used before this patch come out of it exactly:
++ * vertex 0x80000138/0x00001800 and fragment 0x80000128/0x00003000, which is
++ * why the whole of the probe-16 test set is also this packer's regression
++ * test.
++ */
++static void
++sm_shader_pack(uint32_t *spd, const struct sm_shader *sh, uint64_t code_a)
++{
++	uint32_t w0 = 8u;	/* Descriptor Type: Shader */
++
++	if (sh->stage == SM_STAGE_VERTEX) {
++		w0 |= 3u << 4;			/* Stage: Vertex */
++		w0 |= 1u << 8;			/* Vertex warp limit: half */
++	} else {
++		w0 |= 2u << 4;			/* Stage: Fragment */
++		w0 |= 1u << 8;			/* Coverage bitmask type: GL */
++	}
++	/* pan_register_allocation(): 32 registers per thread above 32. */
++	w0 |= (sh->work_reg_count <= 32u ? 2u : 0u) << 30;
++
++	spd[0] = w0;
++	/*
++	 * pan_shader_info.preload is a register mask; the descriptor carries
++	 * r48..r63 one bit each, so the mask's bits 48..63 are word1 bits
++	 * 0..15 verbatim -- the same shift Mesa's own packer uses
++	 * (panvk_vX_shader.c: spd.preload.r48_r63 = info->preload >> 48).
++	 * For these shaders that is 0x1800 (vertex), 0x3000 (fragment) and
++	 * 0x3800 (attribute vertex), the values the descriptors have carried
++	 * since probe 9.
++	 */
++	spd[1] = (uint32_t)(sh->preload >> 48);
++	spd[2] = (uint32_t)code_a;
++	spd[3] = (uint32_t)(code_a >> 32);
++}
++
++/* What pan_shad reported for each blob: work_reg_count, preload, stage. */
++static const struct sm_shader sm_sh_panel_vs = { sm_panel_vs_code, 64u,
++	32u, 0x18ull << 56, SM_STAGE_VERTEX };
++static const struct sm_shader sm_sh_panel_fs = { sm_panel_fs_code, 32u,
++	32u, 0x30ull << 56, SM_STAGE_FRAGMENT };
++static const struct sm_shader sm_sh_attr_vs = { sm_vs_attr_code, 64u,
++	32u, 0x38ull << 56, SM_STAGE_VERTEX };
++static const struct sm_shader sm_sh_fs_blue = { sm_fs_blue_code, 32u,
++	32u, 0x30ull << 56, SM_STAGE_FRAGMENT };
++static const struct sm_shader sm_sh_vs_off = { sm_vs_off_code, 64u,
++	32u, 0x18ull << 56, SM_STAGE_VERTEX };
++
++/* Copy a blob into one of the page's code slots. */
++static void
++sm_shader_copy(uint32_t *dst, const struct sm_shader *sh)
++{
++	uint32_t i;
++
++	for (i = 0; i < sh->words; i++) {
++		dst[i] = sh->code[i];
++	}
++}
++
++/* Depth/stencil descriptor: the fragment pass always fetches one. */
++static const uint32_t sm_ds_null[8] = {
++	0x00070077u, 0xffffffffu, 0x00000000u, 0x00000000u,
++	0xe4c00000u, 0x00000000u, 0x00000000u, 0x00000000u,
++};
++
++static uint32_t
++sm_job_submit(uint64_t job_pa, uint32_t cfg, uint32_t affinity, uint32_t slot)
++{
++	uint32_t status = 0;
++	uint32_t i;
++
++	sm_wr(sm.gpu + SM_JOB_INT_MASK, 0);
++	sm_wr(sm.gpu + SM_JOB_INT_CLEAR, 0xffffffffu);
++	sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
++
++	sm_wr(sm.gpu + SM_JS_HEAD_NEXT_LO(slot), (uint32_t)job_pa);
++	sm_wr(sm.gpu + SM_JS_HEAD_NEXT_HI(slot), (uint32_t)(job_pa >> 32));
++	sm_wr(sm.gpu + SM_JS_AFFINITY_NEXT_LO(slot), affinity);
++	sm_wr(sm.gpu + SM_JS_AFFINITY_NEXT_HI(slot), 0);
++	sm_wr(sm.gpu + SM_JS_CONFIG_NEXT(slot), cfg);
++	sm_wr(sm.gpu + SM_JS_COMMAND_NEXT(slot), SM_JS_COMMAND_START);
++
++	for (i = 0; i < SM_TIMEOUT_STEPS; i++) {
++		status = sm_rd(sm.gpu + SM_JOB_INT_RAWSTAT);
++		if (status & ((1u << slot) | (1u << (16u + slot)))) {
++			break;
++		}
++		delay(SM_TIMEOUT_US);
++	}
++	sm_wr(sm.gpu + SM_JOB_INT_CLEAR, status);
++	return status;
++}
++
++/*
++ * Render the shim's proven triangle straight into the real panel
++ * framebuffer.  Same fixed configuration the shim used for its panel demo:
++ * all vertex-job sections, compact descriptor layout, 32 MiB tiler heap,
++ * IDVS job on JS1, fragment job on JS0, both with START_MMU.
++ */
++/*
++ * Read one pixel back through the CPU.  The panel framebuffer is far larger
++ * than the kernel's 8 MiB io_submap, so map only the 4 KiB page holding the
++ * requested pixel and read inside it.
++ */
++static uint32_t
++sm_fb_read_pixel(uint64_t fb_pa, uint32_t stride, uint32_t row, uint32_t col)
++{
++	uint64_t off = (uint64_t)row * stride + (uint64_t)col * 4u;
++	vm_offset_t va;
++
++	va = ml_io_map((vm_offset_t)((fb_pa + off) & ~0xfffull),
++	    SM_GPU_PAGE_SIZE);
++	if (!va) {
++		return 0xffffffffu;
++	}
++	return *(volatile uint32_t *)(va + (off & 0xfffull));
++}
++
++/*
++ * Write one pixel through the CPU, used to poison the probe pixels before a
++ * draw so "the triangle was not rasterised" cannot be confused with stale
++ * paint left by an earlier case.
++ */
++static void
++sm_fb_write_pixel(uint64_t fb_pa, uint32_t stride, uint32_t row, uint32_t col,
++    uint32_t value)
++{
++	uint64_t off = (uint64_t)row * stride + (uint64_t)col * 4u;
++	vm_offset_t va;
++
++	va = ml_io_map((vm_offset_t)((fb_pa + off) & ~0xfffull),
++	    SM_GPU_PAGE_SIZE);
++	if (!va) {
++		return;
++	}
++	*(volatile uint32_t *)(va + (off & 0xfffull)) = value;
++}
++
++/*
++ * A rejected job (JS_STATUS 0x58 DATA_INVALID_FAULT) stops the job slot and
++ * every later submission on it fails the same way.  The shim proved that a
++ * full "case reset" (GPU soft reset + G57 quirks + power units + AS0 reload)
++ * is what makes a battery of cases independent, so every probe case that
++ * follows a possible fault starts from that exact state.
++ */
++static int
++sm_case_reset(void)
++{
++	uint32_t acp_before;
++	uint32_t acp_after;
++	int rc;
++
++	acp_before = sm_rd(sm.infra + SM_MFG_SLAVE_GALS_CTRL);
++	rc = sm_soft_reset();
++	if (rc) {
++		return rc;
++	}
++	sm_apply_g57_quirks();
++	rc = sm_power_units_on();
++	if (rc) {
++		return rc;
++	}
++	rc = sm_mmu_configure_as(0, sm.tables_pa);
++	if (rc) {
++		return rc;
++	}
++	/*
++	 * A soft reset clears every address space's registers, so AS1 has to
++	 * be re-pointed at its own table set too, exactly as AS0 is.  The
++	 * page tables in memory are untouched by a reset.
++	 */
++	rc = sm_mmu_configure_as(1, sm.as1_tables_pa);
++	if (rc) {
++		return rc;
++	}
++	/*
++	 * MediaTek's broken MFG->ACP route is what makes every job fault with
++	 * DATA_INVALID_FAULT, so re-assert the disable and show whether the
++	 * reset/power sequence re-enabled it behind our back.
++	 */
++	acp_after = sm_rd(sm.infra + SM_MFG_SLAVE_GALS_CTRL);
++	sm_disable_acp();
++	printf("SWEETMALI: IDX ACP reset before=%x after=%x bit9=%u/%u\n",
++	    acp_before, acp_after, (acp_before >> SM_DIS_MFG2ACP_BIT) & 1u,
++	    (acp_after >> SM_DIS_MFG2ACP_BIT) & 1u);
++	return 0;
++}
++
++/*
++ * One exact copy of the batch the case loop calls "base": cache flush on
++ * slot 0, vertex job on slot 1, fragment job on slot 0, with the same field
++ * setup and the same cache maintenance.  Everything that is printed comes
++ * straight from the hardware.
++ */
++/*
++ * The hardware stores the per-job exception status in words 0..3 of the job
++ * header and refuses to start a job whose word 0 is already non-zero (the
++ * fault pointer then points at the header itself, exception 0x10258).  So a
++ * header can only be reused after its status words have been cleared.
++ */
++/*
++ * The whole descriptor page, byte for byte, as the builder left it.  Every
++ * round after the first restores this, so any difference the hardware makes
++ * is either visible in the diff or has no effect at all.
++ */
++static uint32_t sm_snap[1024];
++
++static void
++sm_snap_take(void)
++{
++	volatile uint32_t *p = (volatile uint32_t *)sm.tri;
++	uint32_t i;
++
++	for (i = 0; i < 1024u; i++) {
++		sm_snap[i] = p[i];
++	}
++}
++
++static void
++sm_snap_restore(void)
++{
++	volatile uint32_t *p = (volatile uint32_t *)sm.tri;
++	uint32_t i;
++
++	for (i = 0; i < 1024u; i++) {
++		p[i] = sm_snap[i];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	sm_cache_clean_invalidate(sm.tri, SM_GPU_PAGE_SIZE);
++}
++
++static void
++sm_snap_diff(const char *tag)
++{
++	volatile uint32_t *p = (volatile uint32_t *)sm.tri;
++	uint32_t n = 0;
++	uint32_t i;
++
++	for (i = 0; i < 1024u; i++) {
++		if (p[i] != sm_snap[i]) {
++			n++;
++			if (n <= 20u) {
++				printf("SWEETMALI: DIFF %s off=%x old=%x new=%x\n",
++				    tag, i * 4u, sm_snap[i], p[i]);
++			}
++		}
++	}
++	printf("SWEETMALI: DIFF %s total=%u\n", tag, n);
++}
++
++static int
++sm_triangle_demo(void)
++{
++	uint8_t *base = (uint8_t *)sm.tri;
++	uint64_t base_pa = sm.tri_pa;
++	uint32_t *frag = (uint32_t *)(base + SM_TRI_FRAG);
++	uint32_t *fbd = (uint32_t *)(base + SM_TRI_FBD);
++	uint32_t *rt = (uint32_t *)(base + SM_TRI_RT);
++	uint32_t *heap = (uint32_t *)(base + SM_TRI_HEAP);
++	uint32_t *tctx = (uint32_t *)(base + SM_TRI_TCTX);
++	uint32_t *vspd = (uint32_t *)(base + SM_TRI_VSPD);
++	uint32_t *fspd = (uint32_t *)(base + SM_TRI_FSPD);
++	uint32_t *blnd = (uint32_t *)(base + SM_TRI_BLND);
++	uint32_t *vcode = (uint32_t *)(base + SM_TRI_VSCODE);
++	uint32_t *fcode = (uint32_t *)(base + SM_TRI_FSCODE);
++	uint32_t *vjob = (uint32_t *)(base + SM_TRI_VJOB);
++	uint32_t *cflush = (uint32_t *)(base + SM_TRI_CFLUSH);
++	uint32_t *ds = (uint32_t *)(base + SM_TRI_DS_OFF);
++
++	const uint64_t fb_base = SM_PANEL_FB_PA;
++	const uint32_t fb_w = SM_PANEL_W;
++	const uint32_t fb_h = SM_PANEL_H;
++	const uint32_t fb_stride = SM_PANEL_STRIDE;
++	const uint32_t fb_tiles_x = (fb_w + 15u) >> 4;
++	const uint32_t fb_tiles_y = (fb_h + 15u) >> 4;
++
++	const uint64_t frag_a = base_pa + SM_TRI_FRAG;
++	const uint64_t fbd_a = (base_pa + SM_TRI_FBD) | 1u;
++	const uint64_t heap_a = base_pa + SM_TRI_HEAP;
++	const uint64_t tctx_a = base_pa + SM_TRI_TCTX;
++	const uint64_t vspd_a = base_pa + SM_TRI_VSPD;
++	const uint64_t fspd_a = base_pa + SM_TRI_FSPD;
++	const uint64_t blnd_a = base_pa + SM_TRI_BLND;
++	const uint64_t vjob_a = base_pa + SM_TRI_VJOB;
++	const uint64_t cflush_a = base_pa + SM_TRI_CFLUSH;
++	const uint64_t res_a = base_pa + SM_TRI_RES;
++	const uint64_t ds_a = base_pa + SM_TRI_DS_OFF;
++	const uint64_t tls_a = base_pa + 0xf00u;
++	const uint64_t vcode_a = base_pa + SM_TRI_VSCODE;
++	const uint64_t fcode_a = base_pa + SM_TRI_FSCODE;
++
++	/*
++	 * The same thing inside the custom VA window.  Offsets inside a
++	 * 2 MiB block are preserved, so every page internal address keeps
++	 * its offset from the page base.  These are deliberately not the
++	 * physical addresses: a case that uses them only works if the
++	 * hardware translates.
++	 *
++	 * They are recomputed before every case, because A3/B1 cases name a
++	 * VA that the *allocator* picked instead (see sm_case_va_base()).
++	 */
++	uint64_t va_tri;
++	uint64_t va_heap = SM_VAW_HEAP +
++	    (sm.heap_pa & (SM_MALI_BLOCK_2M - 1ull));
++	uint64_t va_fb = SM_VAW_FB +
++	    (fb_base & (SM_MALI_BLOCK_2M - 1ull));
++	uint64_t va_vspd;
++	uint64_t va_fspd;
++	uint64_t va_vcode;
++	uint64_t va_fcode;
++	uint64_t va_res;
++	uint64_t va_ds;
++	uint64_t va_blnd;
++	uint64_t va_attr;
++	uint64_t va_abuf;
++	uint64_t va_heapdesc;
++	uint64_t va_tctx;
++	uint64_t va_fbd;
++	uint64_t va_tls;
++
++	uint64_t rtab;
++	uint64_t zero;
++	uint32_t vst;
++	uint32_t vjs;
++	uint32_t fjs = 0xdeadbeefu;
++	uint32_t mmu;
++	uint32_t pxc;
++	uint32_t pxa;
++	uint32_t pxk;
++	uint32_t i;
++
++	/* Keep kernel console text off the panel so it cannot overwrite the
++	 * triangle; the persistent ring still gets every log line. */
++	sweet_console_muted = 1;
++
++	for (i = 0; i < SM_GPU_PAGE_SIZE / 4u; i++) {
++		((uint32_t *)base)[i] = 0;
++	}
++	for (i = 0; i < 64u; i++) {
++		vcode[i] = sm_panel_vs_code[i];
++	}
++	for (i = 0; i < 32u; i++) {
++		fcode[i] = sm_panel_fs_code[i];
++	}
++	for (i = 0; i < 8u; i++) {
++		ds[i] = sm_ds_null[i];
++	}
++
++	/* Shader programs: packed from the metadata pan_shad reported. */
++	sm_shader_pack(vspd, &sm_sh_panel_vs, vcode_a);
++	sm_shader_pack(fspd, &sm_sh_panel_fs, fcode_a);
++	printf("SWEETMALI: SPD panel vs=%08x/%08x fs=%08x/%08x\n",
++	    vspd[0], vspd[1], fspd[0], fspd[1]);
++
++	blnd[0] = 0x00000a00u;
++	blnd[1] = 0xf0122122u;
++	blnd[2] = 0x0000001au;
++	blnd[3] = 0x000ed000u;
++
++	/*
++	 * Vertex attributes.  The ATTRIBUTE descriptor names a BUFFER
++	 * descriptor by index; the BUFFER descriptor carries the address of
++	 * the vertex data.  Three vertex blocks share one descriptor layout,
++	 * so a case only changes the buffer index:
++	 *   0 = exactly the triangle the panel VS builds from VERTEX_ID
++	 *       (-0.75,-0.75) (0.75,-0.75) (0,0.75),
++	 *   1 = three coincident vertices: nothing may be drawn,
++	 *   2 = but the top half only: covers y=1000 and not y=1900.
++	 * Resource table 1 points at the attribute descriptors, table 2 at
++	 * the buffer descriptors; both carry the "contains descriptors" bit.
++	 */
++	{
++		uint32_t vb[3][12] = {
++			{ 0xbf400000u, 0xbf400000u, 0x00000000u, 0x3f800000u,
++			  0x3f400000u, 0xbf400000u, 0x00000000u, 0x3f800000u,
++			  0x00000000u, 0x3f400000u, 0x00000000u, 0x3f800000u },
++			{ 0x00000000u, 0x00000000u, 0x00000000u, 0x3f800000u,
++			  0x00000000u, 0x00000000u, 0x00000000u, 0x3f800000u,
++			  0x00000000u, 0x00000000u, 0x00000000u, 0x3f800000u },
++			{ 0xbf400000u, 0x3f800000u, 0x00000000u, 0x3f800000u,
++			  0x3f400000u, 0x3f800000u, 0x00000000u, 0x3f800000u,
++			  0x00000000u, 0x3dccccccu, 0x00000000u, 0x3f800000u },
++		};
++		uint32_t *res = (uint32_t *)(base + SM_TRI_RES);
++		uint32_t *va = (uint32_t *)(base + SM_TRI_ATTR);
++		const uint64_t attr_a = base_pa + SM_TRI_ATTR;
++		const uint64_t abuf_a = base_pa + SM_TRI_ATTRBUF;
++		uint32_t bi;
++
++		for (bi = 0; bi < 3u; bi++) {
++			uint32_t *vp = (uint32_t *)(base + SM_TRI_VBUF +
++			    bi * SM_TRI_VBLK);
++			uint32_t *bp = (uint32_t *)(base + SM_TRI_ATTRBUF +
++			    bi * 32u);
++			const uint64_t vpa = base_pa + SM_TRI_VBUF +
++			    bi * SM_TRI_VBLK;
++
++			for (i = 0; i < 12u; i++) {
++				vp[i] = vb[bi][i];
++			}
++			/* Type = Buffer (9), buffer type Simple (1),
++			 * 32-bit size, then the 64-bit address. */
++			bp[0] = 9u | (1u << 4);
++			bp[1] = 48u;
++			bp[2] = (uint32_t)vpa;
++			bp[3] = (uint32_t)(vpa >> 32);
++		}
++
++		/* Type = Attribute (5), attribute type 1D (1), offset
++		 * enable, R32G32B32A32_FLOAT, buffer table 2, vertex
++		 * frequency, offset 0, buffer index patched per case,
++		 * stride 16.
++		 *
++		 * The Format field is a Mali *pixel format*, not a bare
++		 * format index: MALI_PACK_FMT(name, swizzle, srgb) is
++		 * ((index << 12) | swizzle | (srgb << 20)) and the field
++		 * sits at bit 10 of the descriptor word.  Index 191
++		 * (RGBA32F) therefore has to be written as 191 << 12 (the
++		 * same value pan_special_format() builds with "index <<
++		 * 12"); writing 191 alone leaves the index part of the
++		 * field zero, which is an unassigned format entry, and the
++		 * hardware then hands the vertex shader a constant zero
++		 * vector for every vertex -- which is exactly the
++		 * "degenerate triangle at (540,1218)" this probe used to
++		 * observe for every attribute case. */
++		va[0] = 5u | (1u << 4) | (1u << 8) |
++		    (SM_ATTR_PIXFMT << 10);
++		va[1] = 2u;
++		va[2] = 0u;
++		va[3] = 0u;
++		va[4] = 16u;
++
++		res[1 * 4u + 0u] = (uint32_t)attr_a;
++		res[1 * 4u + 1u] = (uint32_t)(attr_a >> 32) | (1u << 24);
++		res[1 * 4u + 2u] = 32u;
++		res[1 * 4u + 3u] = 0u;
++		res[2 * 4u + 0u] = (uint32_t)abuf_a;
++		res[2 * 4u + 1u] = (uint32_t)(abuf_a >> 32) | (1u << 24);
++		res[2 * 4u + 2u] = 3u * 32u;
++		res[2 * 4u + 3u] = 0u;
++	}
++
++	/* Fragment job. */
++	frag[4] = (9u << 1) | (1u << 16);
++	frag[8] = 0;
++	frag[9] = (fb_tiles_x - 1u) | ((fb_tiles_y - 1u) << 16);
++	frag[10] = (uint32_t)fbd_a;
++	frag[11] = (uint32_t)(fbd_a >> 32);
++
++	/* Tiler heap descriptor (points at the real heap memory).  The chunk
++	 * enum must not exceed the block that actually got allocated. */
++	{
++		uint32_t chunk = 0;
++
++		if (sm.heap_size >= 0x200000ull) {
++			chunk = 3;
++		} else if (sm.heap_size >= 0x100000ull) {
++			chunk = 2;
++		} else if (sm.heap_size >= 0x80000ull) {
++			chunk = 1;
++		}
++		heap[0] = 9u | (2u << 4) | (chunk << 8);
++	}
++	heap[1] = (uint32_t)sm.heap_size;
++	heap[2] = (uint32_t)sm.heap_pa;
++	heap[3] = (uint32_t)(sm.heap_pa >> 32);
++	heap[4] = heap[2];
++	heap[5] = heap[3];
++	heap[6] = (uint32_t)(sm.heap_pa + sm.heap_size);
++	heap[7] = (uint32_t)((sm.heap_pa + sm.heap_size) >> 32);
++
++	/* Tiler context. */
++	tctx[2] = 0xffu;
++	tctx[3] = (fb_w - 1u) | ((fb_h - 1u) << 16);
++	tctx[6] = (uint32_t)heap_a;
++	tctx[7] = (uint32_t)(heap_a >> 32);
++
++	/* Framebuffer descriptor. */
++	fbd[8] = (fb_w - 1u) | ((fb_h - 1u) << 16);
++	fbd[9] = 0;
++	fbd[10] = (fb_w - 1u) | ((fb_h - 1u) << 16);
++	fbd[11] = (4u << 9) | (2u << 6) | (1u << 15) | (1u << 24);
++	fbd[12] = 1u << 16;
++	fbd[14] = (uint32_t)tctx_a;
++	fbd[15] = (uint32_t)(tctx_a >> 32);
++
++	/* Render target: linear RGBA8, opaque black clear, writeback. */
++	rt[0] = 1u << 26;
++	rt[1] = 1u | (19u << 3) | (2u << 8) | (1u << 15) | (0x60au << 16) |
++	    (1u << 31);
++	rt[8] = (uint32_t)fb_base;
++	rt[9] = (uint32_t)(fb_base >> 32);
++	rt[10] = fb_stride;
++	rt[12] = 0xff000000u;
++	rt[13] = 0xff000000u;
++	rt[14] = 0xff000000u;
++	rt[15] = 0xff000000u;
++
++	/*
++	 * Index buffers.  The position shader is the already-proven one: it
++	 * derives all three vertices from VERTEX_ID, so the geometry does not
++	 * depend on an attribute fetch yet.  Turning the index buffer on makes
++	 * the hardware load VERTEX_ID from memory instead of counting 0,1,2,
++	 * so {0,1,2} still draws the triangle while {0,0,0} collapses to a
++	 * degenerate, invisible triangle.  That difference is the proof the
++	 * index buffer is really read.
++	 */
++	/*
++	 * where: 0 = indices inside the tri page @ 0xd00,
++	 *        1 = indices in the separate 4 KiB target page,
++	 *        2 = no index address at all (NULL).
++	 * flags: bit0 = clear allow-rotating (bit 15 of the primitive word),
++	 *        bit1 = vertex attribute stride 16 instead of 0.
++	 * reset: 1 = run the GPU reset first (logs the ACP bit around it).
++	 * zero:  1 = clear the hardware-written header words 0..3 before
++	 *        submitting.  A finished job leaves word 0 = 1 behind, and a
++	 *        re-submitted descriptor with that leftover is rejected with
++	 *        DATA_INVALID_FAULT, so this is the variable under test.
++	 * expect: 1 = must draw, 0 = must stay empty, -1 = informational only.
++	 */
++	static const struct {
++		const char *name;
++		uint32_t type;	/* 0 = non-indexed, else Mali index type */
++		uint32_t v[3];
++		uint32_t where;
++		uint32_t flags;
++		uint32_t reset;
++		uint32_t zero;
++		int32_t expect;
++		uint32_t vsattr;	/* 1 = attribute-fetch vertex shader */
++		uint32_t vbi;		/* bits 0..7 attribute buffer index;
++					 * bit 8 also points the Varying shader
++					 * env at our resource table;
++					 * bits 12..15 select the ATTRIBUTE
++					 * Format encoding (0 = pixel format,
++					 * 1 = snap4, 2 = bare index, 3 = 0);
++					 * bit 16 = stride 0 instead of 16 */
++		uint32_t va;		/* SM_VA_* bits: which pointers of
++					 * this batch use the custom GPU VA
++					 * window instead of the PA, or the
++					 * BO / guard VA the allocator
++					 * handed out */
++		uint32_t action;	/* SM_ACT_*: the BO lifecycle step
++					 * to run before this batch */
++		uint32_t sh;		/* SM_SH_*: which shader pair the
++					 * descriptors are packed from */
++		uint32_t pxmode;	/* SM_PX_*: what the pixel probes
++					 * must show (see above) */
++	} cases[] = {
++		{ "base",       0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 0u,  1, 0u, 0u },
++		{ "base-z",     0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "u16-z",      2u, { 0u, 1u, 2u }, 1u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "u16-z-tri",  2u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "u16-z2",     2u, { 0u, 1u, 2u }, 1u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "u16-aaa-z",  2u, { 0u, 0u, 0u }, 1u, 0u, 0u, 1u,  0, 0u, 0u },
++		{ "u32-z",      3u, { 0u, 1u, 2u }, 1u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "u8-z",       1u, { 0u, 1u, 2u }, 1u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "u16-null-z", 2u, { 0u, 1u, 2u }, 2u, 0u, 0u, 1u, -1, 0u, 0u },
++		{ "attr",       0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u },
++		{ "attr-var",   0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u, -1, 1u, 0x100u },
++		{ "attr-dg",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 1u },
++		{ "attr-up",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 2u },
++		{ "prehi",      0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 0u,  1, 2u, 0u },
++		{ "attr-p18",   0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u, -1, 3u, 0u },
++		/* Format-field controls: the bare index must fail, the
++		 * pixel-format encoding must work. */
++		{ "attr-bare",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0x2000u },
++		{ "attr-snap",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u, -1, 1u, 0x1000u },
++		{ "attr-f0",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u, -1, 1u, 0x3000u },
++		{ "attr-str0",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0x10000u },
++		{ "base-mid",   0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u },
++		{ "base-rst",   0u, { 0u, 1u, 2u }, 0u, 0u, 1u, 1u,  1, 0u, 0u },
++		{ "base-nz",    0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 2u,  0, 0u, 0u },
++		{ "base-end-z", 0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u },
++		/* Non-identity GPU VA: exactly one pointer class differs
++		 * from the "attr" case, so a failure names the class the
++		 * hardware does not translate.  All of them must draw. */
++		{ "va-code",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_CODE },
++		{ "va-desc",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_DESC },
++		{ "va-tbl",     0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_TBL },
++		{ "va-vtx",     0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_VTX },
++		{ "va-heap",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_HEAP },
++		{ "va-fb",      0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_FB },
++		{ "va-4k",      0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_4K },
++		{ "va-all",     0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_ALL },
++		{ "va-all-base",0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u,
++		    SM_VA_ALL },
++		/* Negative control, last on purpose: the code address is one
++		 * unmapped 4 KiB page past the mapped one, so the fetch must
++		 * fault (and, as probe 11 showed, wedge JS0 until a reset). */
++		{ "va-4k-neigh",0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_4K | SM_VA_NEIGH },
++		/* Informational: does a soft reset recover a wedged JS? */
++		{ "rst-4k",     0u, { 0u, 1u, 2u }, 0u, 0u, 1u, 1u, -1, 0u, 0u },
++		/*
++		 * The same 4 KiB VA through the whole lifetime a BO needs.
++		 * va-4k above drew through it, so its translation is live and
++		 * cached: after the unmap the fetch must be *refused* (a
++		 * stale walk cache would still draw), then the PTE points at
++		 * a page of zeros -- mapped, so no fault, but not code -- and
++		 * finally back at the code page, where it draws again.
++		 */
++		{ "4k-unmap",   0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_4K | SM_VA_4K_UNMAP },
++		{ "4k-unmap-rst", 0u, { 0u, 1u, 2u }, 0u, 0u, 1u, 1u, -1, 0u, 0u },
++		{ "4k-zero",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_4K | SM_VA_4K_ZERO },
++		{ "4k-reuse",   0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_4K | SM_VA_4K_CODE },
++		/*
++		 * A4: two address spaces.  The same batch, the same
++		 * pointers, the same page-table set built by the same code --
++		 * AS0's 4 KiB page holds the shader code, AS1's holds a page
++		 * of zeros.  The only difference between the two cases is the
++		 * number in the low bits of JS_CONFIG, so the outcome is a
++		 * direct statement about which table set the walk used: AS0
++		 * draws, AS1 does not fault (the page *is* mapped there) and
++		 * cannot execute.
++		 */
++		{ "as0-4k",     0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_4K },
++		{ "as1-4k",     0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_4K | SM_VA_AS1 },
++		/*
++		 * AS1 with that one PTE cleared: the fetch must fault, and the
++		 * fault has to be attributed to AS1 -- AS0's fault registers
++		 * must stay clear, which the FAULT line prints.
++		 */
++		{ "as1-nomap",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_4K | SM_VA_AS1 | SM_VA_4K_UNMAP },
++		{ "as1-nomap-rst", 0u, { 0u, 1u, 2u }, 0u, 0u, 1u, 1u, -1, 0u, 0u },
++		/*
++		 * Back on AS0, through the same 4 KiB VA: it still draws, so
++		 * nothing AS1 did disturbed AS0's tables.
++		 */
++		{ "as0-after",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_4K },
++		/*
++		 * A3/B1: the VA and the memory are chosen at runtime now.  A
++		 * BO is one contiguous physical allocation with a handle; the
++		 * allocator hands it a VA out of the 256 MiB area and takes
++		 * the table pages for that VA out of the pool on first touch.
++		 * The batch's own page -- code, descriptors, tables, vertex
++		 * data -- is read through the BO's mapping, so it draws only
++		 * if that mapping is real.  `IDXB` prints the VAs, the PAs
++		 * and the pool counter after every step.
++		 *
++		 * BO0 is one page at the first free VA; BO1 is 2 MiB, which
++		 * runs past the first PMD entry and therefore forces a
++		 * *second* PTE page to be created.
++		 */
++		{ "bo0-map",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_BO0 | SM_VA_ALL, SM_ACT_BO0 },
++		{ "bo1-map",    0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_BO1 | SM_VA_ALL, SM_ACT_BO1 },
++		/*
++		 * BO0 again, after BO1 added its tables: the first BO's
++		 * mapping must still be there and still work, which is what
++		 * says lazy creation did not disturb what was mapped before.
++		 */
++		{ "bo0-again",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_BO0 | SM_VA_ALL, SM_ACT_BO0 },
++		/*
++		 * Free BO0: the VA is unmapped (leaf cleared + FLUSH_PT) and
++		 * the memory is handed back, so the same batch must now be
++		 * refused -- the unmap half of the lifecycle.
++		 */
++		{ "bo0-free",   0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_BO0 | SM_VA_CODE | SM_VA_UNMAPPED, SM_ACT_BO0_FREE },
++		/*
++		 * A new BO must get BO0's VA back -- first fit -- with a
++		 * *different* physical page, and the batch must draw again.
++		 */
++		{ "bo2-reuse",  0u, { 0u, 0u, 0u }, 0u, 0u, 1u, 1u,  1, 1u, 0u,
++		    SM_VA_BO2 | SM_VA_ALL, SM_ACT_BO2 },
++		/*
++		 * Guard: a VA inside the area that was never allocated.  It
++		 * shares the area's PTE page with BO2 but has no leaf, so the
++		 * fetch must fault at exactly that address -- the allocator's
++		 * unmapped space is not silently identity-mapped.
++		 */
++		{ "bo-guard",   0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  0, 1u, 0u,
++		    SM_VA_GUARD | SM_VA_CODE | SM_VA_UNMAPPED, SM_ACT_NONE },
++		{ "bo-fin",     0u, { 0u, 0u, 0u }, 0u, 0u, 1u, 1u, -1, 0u, 0u,
++		    0u, SM_ACT_BO_FIN },
++		/*
++		 * C1: the program descriptors are packed from the metadata the
++		 * compiler reports now, and these batches run shader blobs the
++		 * kernel has never executed.  sh-base is the same batch as
++		 * "base" -- same pointers, same template -- but its
++		 * descriptors are the ones sm_shader_pack() produces from the
++		 * panel metadata, which is why every case above is also the
++		 * packer's regression test.
++		 */
++		{ "sh-base",    0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u,
++		    0u, SM_ACT_NONE, SM_SH_NONE, SM_PX_OLD },
++		/*
++		 * sh-fs keeps the panel vertex shader and swaps only the
++		 * fragment shader: the geometry is the panel triangle, so the
++		 * two inside probes must come back in the new shader's colour
++		 * and the outside probe must stay the job's black clear.
++		 */
++		{ "sh-fs",      0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u,
++		    0u, SM_ACT_NONE, SM_SH_FS_BLUE, SM_PX_NEW },
++		/*
++		 * sh-vs swaps both: the new vertex shader puts the triangle
++		 * at the top-left corner of the panel (0,2314) (270,2314)
++		 * (135,1949), so now both inside probes must be the clear and
++		 * the *outside* probe must be the new colour.  The panel
++		 * vertex shader paints the inside probes and leaves the
++		 * outside one clear, so this pattern is not producible by the
++		 * code that was there before.
++		 */
++		{ "sh-vs",      0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u,  1, 0u, 0u,
++		    0u, SM_ACT_NONE, SM_SH_VS_OFF, SM_PX_OFF },
++		/*
++		 * C2: the same two blobs, but the page that holds them --
++		 * code, descriptors, everything -- is read through a BO the
++		 * allocator placed, so what the vertex and fragment units
++		 * fetch is bytes in memory the driver allocated at runtime, at
++		 * an address it chose.  Same pattern as sh-vs, or the mapping
++		 * is not real.
++		 */
++		{ "sh-bo",      0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u,  1, 1u, 0u,
++		    SM_VA_BO0 | SM_VA_ALL, SM_ACT_BO0, SM_SH_VS_OFF, SM_PX_OFF },
++		{ "sh-bo-fin",  0u, { 0u, 0u, 0u }, 0u, 0u, 0u, 1u, -1, 0u, 0u,
++		    0u, SM_ACT_BO0_FREE, SM_SH_NONE, SM_PX_OLD },
++		/*
++		 * Control: the new fragment shader's descriptor with the
++		 * vertex stage in it.  Informational -- it either paints (so
++		 * the stage field is not consulted for the fragment program)
++		 * or it does not, and either answer is worth having.
++		 */
++		{ "sh-badstage", 0u, { 0u, 1u, 2u }, 0u, 0u, 0u, 1u, -1, 0u, 0u,
++		    0u, SM_ACT_NONE, SM_SH_FS_BADSTAGE, SM_PX_NEW },
++		/* The reset the A-series cases use, then a plain batch: the
++		 * pipeline has to be exactly where it was before C1. */
++		{ "sh-fin",     0u, { 0u, 1u, 2u }, 0u, 0u, 1u, 1u,  1, 0u, 0u,
++		    0u, SM_ACT_NONE, SM_SH_NONE, SM_PX_OLD },
++	};
++	uint8_t *const idx_inpage = (uint8_t *)(base + SM_TRI_INDICES);
++	uint8_t *const idx_target = (uint8_t *)sm.target;
++	const uint64_t idx_inpage_a = base_pa + SM_TRI_INDICES;
++	const uint64_t idx_target_a = sm.target_pa;
++	uint32_t ci;
++	uint32_t nok = 0;
++	uint32_t ntests = 0;
++	boolean_t draw;
++	/* C1: the colour the swapped-in fragment shader produced, recorded by
++	 * the first case that runs it so the later cases can agree with it. */
++	uint32_t px_new = 0;
++
++	/* IDVS vertex job: all sections, exactly the shim's "panel" case. */
++	vjob[4] = (11u << 1) | (1u << 16);
++	vjob[11] = 3u;
++	vjob[12] = 1u;
++	vjob[13] = 16u;
++	vjob[14] = (uint32_t)tctx_a;
++	vjob[15] = (uint32_t)(tctx_a >> 32);
++	vjob[26] = 0;
++	vjob[27] = (fb_w - 1u) | ((fb_h - 1u) << 16);
++	vjob[28] = 0x3f800000u;
++	vjob[32] = 1u | (1u << 1) | (1u << 7) | (1u << 8) | (1u << 13);
++	vjob[33] = 0xffffu | (1u << 16);
++	vjob[34] = 1u;
++	vjob[39] = 0x3f800000u;
++	vjob[42] = (uint32_t)ds_a;
++	vjob[43] = (uint32_t)(ds_a >> 32);
++	vjob[44] = 1u | ((uint32_t)(blnd_a >> 4) << 4);
++	vjob[45] = (uint32_t)((blnd_a >> 4) >> 28);
++	vjob[58] = (uint32_t)fspd_a;
++	vjob[59] = (uint32_t)(fspd_a >> 32);
++	vjob[74] = (uint32_t)vspd_a;
++	vjob[75] = (uint32_t)(vspd_a >> 32);
++
++	/* Resource table pointer (8 tables) and thread-local scratch. */
++	rtab = res_a | 8u;
++	vjob[72] = (uint32_t)rtab;
++	vjob[73] = (uint32_t)(rtab >> 32);
++	vjob[56] = (uint32_t)rtab;
++	vjob[57] = (uint32_t)(rtab >> 32);
++	vjob[76] = (uint32_t)tls_a;
++	vjob[77] = (uint32_t)(tls_a >> 32);
++	vjob[60] = (uint32_t)tls_a;
++	vjob[61] = (uint32_t)(tls_a >> 32);
++	vjob[78] = (uint32_t)tls_a;
++	vjob[79] = (uint32_t)(tls_a >> 32);
++	vjob[62] = (uint32_t)tls_a;
++	vjob[63] = (uint32_t)(tls_a >> 32);
++
++	/* Cache flush job (shader core LS + L2). */
++	cflush[4] = (3u << 1) | (1u << 16);
++	cflush[8] = 0x03030007u;
++	cflush[9] = 3u;
++
++	/* Refresh the tiler heap window the hardware may walk from base. */
++	zero = sm.heap_size < SM_TILER_HEAP_ZERO ?
++	    sm.heap_size : SM_TILER_HEAP_ZERO;
++
++	/*
++	 * The fully built page is the only state from which a job is known to
++	 * be accepted, so keep a byte-exact copy of it and restore that copy
++	 * before every submission.
++	 */
++	sm_snap_take();
++	sm_snap_diff("built");
++
++	for (ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
++		uint8_t *idxs;
++		uint64_t idx_a;
++		uint32_t exv;
++		uint32_t pre;
++		uint32_t cfst;
++		uint32_t asf;
++		int mmu_want;
++		int rc;
++
++		if (cases[ci].reset) {
++			rc = sm_case_reset();
++			printf("SWEETMALI: IDX %s RESET rc=%d js0=%x js1=%x\n",
++			    cases[ci].name, rc,
++			    sm_rd(sm.gpu + SM_JS_STATUS(0)),
++			    sm_rd(sm.gpu + SM_JS_STATUS(1)));
++			if (rc) {
++				printf("SWEETMALI: IDX %s SKIP reset failed\n",
++				    cases[ci].name);
++				continue;
++			}
++		}
++
++		/*
++		 * The hardware writes state back into the descriptor page:
++		 * words 34..36 of the vertex job, the block at 0x2c0, the tiler
++		 * heap pointers (0x210/0x218) and the polygon list (0x240).
++		 * A header re-submitted with that leftover is rejected with
++		 * DATA_INVALID at its own address (0x58, or 0x10258 when word 0
++		 * is dirty too).  Restoring the built page byte for byte is what
++		 * makes repeated batches possible at all.
++		 */
++		pre = *(volatile uint32_t *)vjob;
++		sm_snap_restore();
++		/*
++		 * Which address space this batch runs in.  kbase's
++		 * kbase_job_hw_submit() puts the AS number in the low four
++		 * bits of JS_CONFIG, so "run in AS1" is one number handed to
++		 * every submission of the case -- the job chain, the
++		 * descriptors and every pointer stay exactly the same, which
++		 * is the point of the test.
++		 */
++		asf = (cases[ci].va & SM_VA_AS1) ? 1u : 0u;
++
++		/*
++		 * A3/B1: the case's lifecycle step runs before the batch, and
++		 * its log line is the state the batch will see.
++		 */
++		if (cases[ci].action && sm_case_action(cases[ci].action,
++		    cases[ci].name)) {
++			printf("SWEETMALI: IDX %s SKIP action failed\n",
++			    cases[ci].name);
++			continue;
++		}
++
++		/*
++		 * Recompute the batch's page-internal addresses for this
++		 * case: the fixed VA window by default, or the VA the BO /
++		 * guard cases name (an address the allocator chose, not a
++		 * constant, and for BO1 a different one from BO0).
++		 */
++		va_tri = sm_case_va_base(cases[ci].va);
++		if (!va_tri) {
++			va_tri = SM_VAW_TRI +
++			    (sm.tri_pa & (SM_MALI_BLOCK_2M - 1ull));
++		}
++		va_vspd = va_tri + SM_TRI_VSPD;
++		va_fspd = va_tri + SM_TRI_FSPD;
++		va_vcode = va_tri + SM_TRI_VSCODE;
++		va_fcode = va_tri + SM_TRI_FSCODE;
++		va_res = va_tri + SM_TRI_RES;
++		va_ds = va_tri + SM_TRI_DS_OFF;
++		va_blnd = va_tri + SM_TRI_BLND;
++		va_attr = va_tri + SM_TRI_ATTR;
++		va_abuf = va_tri + SM_TRI_ATTRBUF;
++		va_heapdesc = va_tri + SM_TRI_HEAP;
++		va_tctx = va_tri + SM_TRI_TCTX;
++		va_fbd = (va_tri + SM_TRI_FBD) | 1u;
++		va_tls = va_tri + 0xf00u;
++
++		if (cases[ci].zero == 2u) {
++			/*
++			 * Control case: fake the leftover the hardware would
++			 * have written and show that the job is refused.
++			 */
++			vjob[0] = 1u;
++		}
++
++		if (cases[ci].vsattr) {
++			/*
++			 * vsattr 1 = attribute VS, 2 = panel VS (control for
++			 * the preload bits), 3 = attribute VS with the panel
++			 * preload mask.
++			 */
++			if (cases[ci].vsattr != 2u) {
++				sm_shader_copy(vcode, &sm_sh_attr_vs);
++			}
++			/*
++			 * The attribute VS preloads r59..r61, the panel VS
++			 * only r59..r60; both descriptors are packed from the
++			 * same metadata, only the preload field differs.
++			 */
++			{
++				struct sm_shader sh = sm_sh_attr_vs;
++
++				if (cases[ci].vsattr == 3u) {
++					sh.preload = sm_sh_panel_vs.preload;
++				}
++				sm_shader_pack(vspd, &sh, vcode_a);
++			}
++			{
++				/*
++				 * Format/stride variants.  vbi bits 12..15
++				 * pick the Format encoding, bit 16 selects
++				 * stride 0 instead of 16.
++				 */
++				uint32_t *va3 = (uint32_t *)(base + SM_TRI_ATTR);
++				uint32_t pix;
++
++				switch ((cases[ci].vbi >> 12) & 0xfu) {
++				case SM_FMT_SNAP4:
++					pix = 94u << 12;
++					break;
++				case SM_FMT_BARE:
++					pix = 191u;
++					break;
++				case SM_FMT_ZERO:
++					pix = 0u;
++					break;
++				default:
++					pix = SM_ATTR_PIXFMT;
++					break;
++				}
++				va3[0] = 5u | (1u << 4) | (1u << 8) |
++				    (pix << 10);
++				va3[3] = cases[ci].vbi & 0xffu;
++				va3[4] = (cases[ci].vbi & 0x10000u) ? 0u : 16u;
++			}
++			if (cases[ci].vbi & 0x100u) {
++				/*
++				 * A/B: the attribute fetch may be served by
++				 * the Varying shader environment's resource
++				 * table instead of the Position one.
++				 */
++				vjob[88] = (uint32_t)rtab;
++				vjob[89] = (uint32_t)(rtab >> 32);
++			}
++			{
++				uint32_t *rr = (uint32_t *)(base + SM_TRI_RES);
++				uint32_t *aa = (uint32_t *)(base + SM_TRI_ATTR);
++				uint32_t *bb = (uint32_t *)(base + SM_TRI_ATTRBUF);
++
++				printf("SWEETMALI: IDXD %s rtab=%x:%x "
++				    "attr=%x/%x/%x/%x/%x res1=%x:%x/%u "
++				    "res2=%x:%x/%u ab0=%x:%x\n", cases[ci].name,
++				    vjob[72], vjob[73], aa[0], aa[1], aa[2], aa[3],
++				    aa[4], rr[4], rr[5], rr[6], rr[8], rr[9],
++				    rr[10], bb[2], bb[3]);
++			}
++		}
++
++		if (cases[ci].sh) {
++			/*
++			 * C1: put a shader the kernel has never run into the
++			 * page's code slot and pack its descriptor from
++			 * metadata.  This runs after the vsattr block (which
++			 * also names a code blob and packs a descriptor) and
++			 * before the VA block, so a BO case copies the page --
++			 * new code, new descriptor -- into the BO like
++			 * everything else.
++			 */
++			switch (cases[ci].sh) {
++			case SM_SH_FS_BLUE:
++				sm_shader_copy(fcode, &sm_sh_fs_blue);
++				sm_shader_pack(fspd, &sm_sh_fs_blue, fcode_a);
++				break;
++			case SM_SH_VS_OFF:
++				sm_shader_copy(vcode, &sm_sh_vs_off);
++				sm_shader_copy(fcode, &sm_sh_fs_blue);
++				sm_shader_pack(vspd, &sm_sh_vs_off, vcode_a);
++				sm_shader_pack(fspd, &sm_sh_fs_blue, fcode_a);
++				break;
++			case SM_SH_FS_BADSTAGE: {
++				struct sm_shader sh = sm_sh_fs_blue;
++
++				sh.stage = SM_STAGE_VERTEX;
++				sm_shader_copy(fcode, &sm_sh_fs_blue);
++				sm_shader_pack(fspd, &sh, fcode_a);
++				break;
++			}
++			default:
++				break;
++			}
++			printf("SWEETMALI: SHAD %s sh=%u vs=%08x/%08x v=%08x "
++			    "fs=%08x/%08x f=%08x\n", cases[ci].name,
++			    cases[ci].sh, vspd[0], vspd[1], vcode[0], fspd[0],
++			    fspd[1], fcode[0]);
++		}
++
++		if (cases[ci].va) {
++			/*
++			 * Point this batch at the custom VA window.  Every
++			 * group is independent so a case can name exactly
++			 * one pointer class.
++			 */
++			uint32_t *p_vspd = (uint32_t *)(base + SM_TRI_VSPD);
++			uint32_t *p_fspd = (uint32_t *)(base + SM_TRI_FSPD);
++			uint32_t *p_res = (uint32_t *)(base + SM_TRI_RES);
++			uint32_t *p_heap = (uint32_t *)(base + SM_TRI_HEAP);
++			uint32_t *p_tctx = (uint32_t *)(base + SM_TRI_TCTX);
++			uint32_t *p_fbd = (uint32_t *)(base + SM_TRI_FBD);
++			uint32_t *p_rt = (uint32_t *)(base + SM_TRI_RT);
++			const uint64_t va_rtab = va_res | 8u;
++
++			if (cases[ci].va & SM_VA_CODE) {
++				p_vspd[2] = (uint32_t)va_vcode;
++				p_vspd[3] = (uint32_t)(va_vcode >> 32);
++				p_fspd[2] = (uint32_t)va_fcode;
++				p_fspd[3] = (uint32_t)(va_fcode >> 32);
++			}
++			if (cases[ci].va & SM_VA_DESC) {
++				vjob[14] = (uint32_t)va_tctx;
++				vjob[15] = (uint32_t)(va_tctx >> 32);
++				vjob[42] = (uint32_t)va_ds;
++				vjob[43] = (uint32_t)(va_ds >> 32);
++				vjob[44] = 1u |
++				    ((uint32_t)(va_blnd >> 4) << 4);
++				vjob[45] = (uint32_t)((va_blnd >> 4) >> 28);
++				vjob[56] = (uint32_t)va_rtab;
++				vjob[57] = (uint32_t)(va_rtab >> 32);
++				vjob[58] = (uint32_t)va_fspd;
++				vjob[59] = (uint32_t)(va_fspd >> 32);
++				vjob[60] = (uint32_t)va_tls;
++				vjob[61] = (uint32_t)(va_tls >> 32);
++				vjob[62] = (uint32_t)va_tls;
++				vjob[63] = (uint32_t)(va_tls >> 32);
++				vjob[72] = (uint32_t)va_rtab;
++				vjob[73] = (uint32_t)(va_rtab >> 32);
++				vjob[74] = (uint32_t)va_vspd;
++				vjob[75] = (uint32_t)(va_vspd >> 32);
++				vjob[76] = (uint32_t)va_tls;
++				vjob[77] = (uint32_t)(va_tls >> 32);
++				vjob[78] = (uint32_t)va_tls;
++				vjob[79] = (uint32_t)(va_tls >> 32);
++				frag[10] = (uint32_t)va_fbd;
++				frag[11] = (uint32_t)(va_fbd >> 32);
++				p_fbd[14] = (uint32_t)va_tctx;
++				p_fbd[15] = (uint32_t)(va_tctx >> 32);
++				p_tctx[6] = (uint32_t)va_heapdesc;
++				p_tctx[7] = (uint32_t)(va_heapdesc >> 32);
++			}
++			if (cases[ci].va & SM_VA_TBL) {
++				p_res[1 * 4u + 0u] = (uint32_t)va_attr;
++				p_res[1 * 4u + 1u] =
++				    (uint32_t)(va_attr >> 32) | (1u << 24);
++				p_res[2 * 4u + 0u] = (uint32_t)va_abuf;
++				p_res[2 * 4u + 1u] =
++				    (uint32_t)(va_abuf >> 32) | (1u << 24);
++			}
++			if (cases[ci].va & SM_VA_VTX) {
++				uint32_t *p_bp = (uint32_t *)(base +
++				    SM_TRI_ATTRBUF +
++				    (cases[ci].vbi & 0xffu) * 32u);
++				const uint64_t va_vtx = va_tri + SM_TRI_VBUF +
++				    (cases[ci].vbi & 0xffu) * SM_TRI_VBLK;
++
++				p_bp[2] = (uint32_t)va_vtx;
++				p_bp[3] = (uint32_t)(va_vtx >> 32);
++			}
++			if (cases[ci].va & SM_VA_4K) {
++				/*
++				 * The position shader's code alone, through the
++				 * 4 KiB mapping of the tri page.  With the
++				 * neighbour flag its address is one 4 KiB page
++				 * further -- an unmapped page, so the fetch
++				 * must fault rather than read the next page of
++				 * the block.
++				 */
++				uint64_t va4k = SM_VAW4K +
++				    (sm.tri_pa & 0xfffull) + SM_TRI_VSCODE;
++
++				if (cases[ci].va & SM_VA_NEIGH) {
++					va4k += 0x1000ull;
++				}
++				/*
++				 * The lifecycle cases change the mapping
++				 * itself, before the batch runs: unmap the
++				 * page, point it at a page of zeros, or point
++				 * it back at the code page.
++				 */
++				if (cases[ci].va & (SM_VA_4K_UNMAP |
++				    SM_VA_4K_ZERO | SM_VA_4K_CODE)) {
++					const uint64_t page4k = SM_VAW4K +
++					    (sm.tri_pa & 0xfffull);
++					uint64_t to = sm.tri_pa;
++
++					if (cases[ci].va & SM_VA_4K_UNMAP) {
++						to = 0;
++					} else if (cases[ci].va &
++					    SM_VA_4K_ZERO) {
++						to = sm.zero_pa;
++					}
++					printf("SWEETMALI: IDXP %s pte4k "
++					    "as=%u va=%llx pa=%llx rc=%d\n",
++					    cases[ci].name, asf,
++					    (unsigned long long)page4k,
++					    (unsigned long long)to,
++					    sm_pte4k_set(asf, page4k, to));
++				}
++				p_vspd[2] = (uint32_t)va4k;
++				p_vspd[3] = (uint32_t)(va4k >> 32);
++			}
++			if (cases[ci].va & SM_VA_HEAP) {
++				p_heap[2] = (uint32_t)va_heap;
++				p_heap[3] = (uint32_t)(va_heap >> 32);
++				p_heap[4] = p_heap[2];
++				p_heap[5] = p_heap[3];
++				p_heap[6] = (uint32_t)(va_heap + sm.heap_size);
++				p_heap[7] =
++				    (uint32_t)((va_heap + sm.heap_size) >> 32);
++			}
++			if (cases[ci].va & SM_VA_FB) {
++				p_rt[8] = (uint32_t)va_fb;
++				p_rt[9] = (uint32_t)(va_fb >> 32);
++			}
++
++			printf("SWEETMALI: IDXA %s va=%x vt=%llx vspd=%x:%x "
++			    "code=%x:%x rtab=%x:%x attr=%x:%x abuf=%x:%x "
++			    "tctx=%x:%x fbd=%x:%x heap=%llx fb=%llx\n",
++			    cases[ci].name, cases[ci].va,
++			    (unsigned long long)va_tri, vjob[74], vjob[75],
++			    p_vspd[2], p_vspd[3], vjob[72], vjob[73], p_res[4],
++			    p_res[5], p_res[8], p_res[9], vjob[14], vjob[15],
++			    frag[10], frag[11], (unsigned long long)va_heap,
++			    (unsigned long long)va_fb);
++
++			/*
++			 * A3/B1: with every pointer edit in, the BO's first
++			 * page gets a byte-exact copy of the descriptor page,
++			 * so the batch reads through the board exactly what it
++			 * would have read through the identity mapping.
++			 */
++			if (cases[ci].va & SM_VA_BO0) {
++				sm_bo_fill(0);
++			} else if (cases[ci].va & SM_VA_BO1) {
++				sm_bo_fill(1);
++			} else if (cases[ci].va & SM_VA_BO2) {
++				sm_bo_fill(2);
++			}
++		}
++
++		vst = 0xdeadbeefu;
++		vjs = 0xdeadbeefu;
++		fjs = 0xdeadbeefu;
++		mmu = 0xdeadbeefu;
++
++		/* Stage the index buffer for this case. */
++		switch (cases[ci].where) {
++		case 1u:
++			idxs = idx_target;
++			idx_a = idx_target_a;
++			break;
++		case 2u:
++			idxs = NULL;
++			idx_a = 0;
++			break;
++		default:
++			idxs = idx_inpage;
++			idx_a = idx_inpage_a;
++			break;
++		}
++		if (idxs) {
++			for (i = 0; i < 3u; i++) {
++				if (cases[ci].type == 1u) {
++					idxs[i] = (uint8_t)cases[ci].v[i];
++				} else if (cases[ci].type == 3u) {
++					((uint32_t *)idxs)[i] = cases[ci].v[i];
++				} else {
++					((uint16_t *)idxs)[i] =
++					    (uint16_t)cases[ci].v[i];
++				}
++			}
++			if (cases[ci].where == 1u) {
++				sm_cache_clean_invalidate(sm.target,
++				    SM_GPU_PAGE_SIZE);
++			}
++		}
++
++		vjob[8] = 8u | (cases[ci].type << 8);
++		if (!(cases[ci].flags & 1u)) {
++			vjob[8] |= 1u << 15;
++		}
++		vjob[13] = (cases[ci].flags & 2u) ? (16u | (16u << 16)) : 16u;
++		vjob[30] = (uint32_t)idx_a;
++		vjob[31] = (uint32_t)(idx_a >> 32);
++
++		{
++			volatile uint32_t *th = (volatile uint32_t *)sm.heap;
++
++			for (i = 0; i < zero / 4u; i++) {
++				th[i] = 0;
++			}
++		}
++		/*
++		 * Poison the three probe pixels.  A case that paints nothing
++		 * must be distinguishable from one whose geometry-less tiles
++		 * were simply not cleared.
++		 */
++		sm_fb_write_pixel(fb_base, fb_stride, 1000u, 540u, 0xdeadbeefu);
++		sm_fb_write_pixel(fb_base, fb_stride, 1900u, 540u, 0xdeadbeefu);
++		sm_fb_write_pixel(fb_base, fb_stride, 2300u, 60u, 0xdeadbeefu);
++		__asm__ volatile("dsb sy" ::: "memory");
++
++		sm_cache_clean_invalidate(sm.tri, SM_GPU_PAGE_SIZE);
++		sm_cache_clean_invalidate(sm.heap, (vm_size_t)zero);
++
++		cfst = sm_job_submit(cflush_a,
++		    SM_JS_CONFIG_BASE | SM_JS_CONFIG_START_MMU | asf,
++		    sm.shader_present, 0);
++		vst = sm_job_submit(vjob_a,
++		    SM_JS_CONFIG_BASE | SM_JS_CONFIG_START_MMU | asf,
++		    sm.shader_present, 1);
++		vjs = sm_rd(sm.gpu + SM_JS_STATUS(1));
++		mmu = sm_rd(sm.gpu + SM_MMU_INT_RAWSTAT);
++		if (!(vst & (1u << (16u + 1u))) && vjs == 0) {
++			sm_job_submit(frag_a,
++			    SM_JS_CONFIG_BASE | SM_JS_CONFIG_START_MMU | asf,
++			    sm.shader_present, 0);
++			fjs = sm_rd(sm.gpu + SM_JS_STATUS(0));
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++
++		/*
++		 * The "Malloc vertex" job makes the hardware allocate the
++		 * vertex packet buffer and write its (address >> 6) back into
++		 * the Draw vertex-array pointer, and the position shader stores
++		 * its result there.  Reading the buffer therefore shows, per
++		 * vertex, exactly what the vertex shader computed -- the only
++		 * way to see what an attribute fetch actually returned.
++		 */
++		{
++			uint64_t vab = ((uint64_t)((vjob[34] >> 6) & 0x03ffffffu)) |
++			    ((uint64_t)vjob[35] << 26);
++
++			vab <<= 6;
++			sm_cache_clean_invalidate(sm.heap, (vm_size_t)zero);
++			if (vab >= sm.heap_pa &&
++			    vab + 3u * 16u <= sm.heap_pa + sm.heap_size) {
++				const volatile uint32_t *pk =
++				    (const volatile uint32_t *)
++				    (sm.heap + (vm_offset_t)(vab - sm.heap_pa));
++
++				printf("SWEETMALI: IDXV %s vab=%llx "
++				    "p0=%08x%08x%08x%08x p1=%08x%08x%08x%08x "
++				    "p2=%08x%08x%08x%08x\n", cases[ci].name,
++				    (unsigned long long)vab, pk[0], pk[1], pk[2],
++				    pk[3], pk[4], pk[5], pk[6], pk[7], pk[8],
++				    pk[9], pk[10], pk[11]);
++			} else {
++				printf("SWEETMALI: IDXV %s vab=%llx outside "
++				    "heap %llx+%llx\n", cases[ci].name,
++				    (unsigned long long)vab,
++				    (unsigned long long)sm.heap_pa,
++				    (unsigned long long)sm.heap_size);
++			}
++		}
++
++		/*
++		 * Whether the position shader actually ran is only observable
++		 * through the packet it stores, and the hardware writes that
++		 * pointer back only when it bins something.  Hunt the whole
++		 * zeroed tiler heap for the position values the shader would
++		 * store: the panel triangle (135/2131.5/945/304.5), or the
++		 * transformed origin (540/1218/32768) that an attribute fetch
++		 * returning zeros produces, or NaN.
++		 */
++		{
++			volatile uint32_t *hp = (volatile uint32_t *)sm.heap;
++			uint32_t n = (uint32_t)(zero / 4u);
++			uint32_t hits = 0u;
++
++			for (i = 0; i < n; i++) {
++				uint32_t w = hp[i];
++
++				if (w == 0x43070000u || w == 0x45053800u ||
++				    w == 0x446c4000u || w == 0x43984000u ||
++				    w == 0x44070000u || w == 0x44984000u ||
++				    w == 0x47000000u || w == 0x7fc00000u) {
++					if (hits < 12u) {
++						printf("SWEETMALI: IDXH %s off=%x "
++						    "w=%08x\n", cases[ci].name,
++						    i * 4u, w);
++					}
++					hits++;
++				}
++			}
++			printf("SWEETMALI: IDXH %s hits=%u\n", cases[ci].name,
++			    hits);
++		}
++
++		pxc = sm_fb_read_pixel(fb_base, fb_stride, 1000u, 540u);
++		pxa = sm_fb_read_pixel(fb_base, fb_stride, 1900u, 540u);
++		pxk = sm_fb_read_pixel(fb_base, fb_stride, 2300u, 60u);
++
++		printf("SWEETMALI: IDX %s t=%u w=%u fl=%u pre=%x cf=%x v=%x js=%x "
++		    "f=%x mmu=%x px=%x/%x/%x\n", cases[ci].name, cases[ci].type,
++		    cases[ci].where, cases[ci].flags, pre, cfst, vst, vjs, fjs,
++		    mmu, pxc, pxa, pxk);
++		/*
++		 * Job-header exception record: word 0 low byte = JS_STATUS
++		 * code, bits 8-9 = access type, words 2-3 = fault pointer,
++		 * word 1 = first incomplete task.
++		 */
++		exv = *(volatile uint32_t *)vjob;
++		if ((vst & (1u << (16u + 1u))) || (exv != 0u)) {
++			printf("SWEETMALI: IDXE %s ex=%x fic=%x fp=%x:%x "
++			    "prim=%x ic=%u al=%x ia=%x:%x\n", cases[ci].name,
++			    exv, vjob[1], vjob[3], vjob[2], vjob[8], vjob[11],
++			    vjob[13], vjob[31], vjob[30]);
++		}
++		/*
++		 * The per-AS fault registers are only populated for real MMU
++		 * faults, which the job's own exception code does not cover.
++		 * Print them for every VA case as well, so a translated fetch
++		 * that fails can be told apart from one that was never walked.
++		 * Both address spaces are printed with the AS the case ran in,
++		 * so a fault is *attributed*: AS1's registers must stay clear
++		 * for an AS0 case and vice versa.
++		 */
++		if (mmu || cases[ci].va) {
++			printf("SWEETMALI: IDX FAULT %s as=%u raw=%x "
++			    "a0=%x/%x:%x a1=%x/%x:%x\n", cases[ci].name, asf,
++			    mmu, sm_rd(sm.gpu + SM_AS_FAULTSTATUS(0)),
++			    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_HI(0)),
++			    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_LO(0)),
++			    sm_rd(sm.gpu + SM_AS_FAULTSTATUS(1)),
++			    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_HI(1)),
++			    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_LO(1)));
++		}
++
++		/*
++		 * The fragment shader paints every covered pixel non-black
++		 * (ARGB32) while the rest of the tile range stays the opaque
++		 * black clear, so "drew" means both inside probes are painted
++		 * and the outside probe is still clear.  A faulted job never
++		 * counts as a draw, and neither does a pixel the case never
++		 * touched: it still holds the poison, which is not black either
++		 * (that is how probe 11's rt-shift was misread as a draw).
++		 *
++		 * C1: when the shader is the thing under test the probes are a
++		 * pattern instead.  The colour the new fragment shader produces
++		 * is not written into this driver: the first case that runs it
++		 * records it, and the cases after it must agree with that and
++		 * differ from the panel colour, so the test is "a different
++		 * shader ran" rather than "this driver's byte order is what I
++		 * remembered".
++		 */
++		switch (cases[ci].pxmode) {
++		case SM_PX_NEW:
++			draw = ((vjs == 0) && (mmu == 0) && (pxc == pxa) &&
++			    (pxc != SM_PX_PANEL) && (pxc != SM_PX_CLEAR) &&
++			    (pxc != SM_PX_POISON) &&
++			    (!px_new || (pxc == px_new)) &&
++			    (pxk == SM_PX_CLEAR)) ? TRUE : FALSE;
++			if (draw) {
++				px_new = pxc;
++			}
++			break;
++		case SM_PX_OFF:
++			draw = ((vjs == 0) && (mmu == 0) &&
++			    (pxc == SM_PX_CLEAR) && (pxa == SM_PX_CLEAR) &&
++			    (pxk != SM_PX_CLEAR) && (pxk != SM_PX_PANEL) &&
++			    (pxk != SM_PX_POISON) &&
++			    (!px_new || (pxk == px_new))) ? TRUE : FALSE;
++			break;
++		default:
++			draw = ((vjs == 0) && (mmu == 0) &&
++			    (pxc != SM_PX_CLEAR) && (pxc != SM_PX_POISON) &&
++			    (pxa != SM_PX_CLEAR) && (pxa != SM_PX_POISON) &&
++			    (pxk == SM_PX_CLEAR)) ? TRUE : FALSE;
++			break;
++		}
++		printf("SWEETMALI: IDX %s %s\n", cases[ci].name,
++		    draw ? (cases[ci].pxmode == SM_PX_NEW ? "NEW-COLOUR" :
++		    (cases[ci].pxmode == SM_PX_OFF ? "OFF-PATTERN" : "DREW")) :
++		    "EMPTY");
++		if (px_new) {
++			printf("SWEETMALI: IDX %s new-colour=%08x\n",
++			    cases[ci].name, px_new);
++		}
++		if (cases[ci].expect < 0) {
++			printf("SWEETMALI: IDX %s INFO only\n", cases[ci].name);
++			continue;
++		}
++		ntests++;
++		/*
++		 * "Empty" covers two very different hardware outcomes, and
++		 * the cases that unmap or step past a 4 KiB page have to tell
++		 * them apart: a fetch the MMU refused (the fault *is* the
++		 * proof that the entry went away) and a fetch that found
++		 * mapped bytes the decoder would not take (no fault, so the
++		 * mapping is live and only its contents are wrong).  The case
++		 * says which outcome it is testing, so a must-fault case that
++		 * quietly finds a translation fails instead of passing as a
++		 * plain empty.
++		 */
++		mmu_want = -1;
++		if (cases[ci].va & (SM_VA_NEIGH | SM_VA_4K_UNMAP |
++		    SM_VA_UNMAPPED)) {
++			mmu_want = 1;
++		} else if ((cases[ci].va & SM_VA_4K_ZERO) ||
++		    ((cases[ci].va & SM_VA_AS1) && cases[ci].expect == 0)) {
++			mmu_want = 0;
++		}
++		if (draw == (cases[ci].expect != 0) &&
++		    (mmu_want < 0 || (mmu != 0u) == (mmu_want != 0))) {
++			nok++;
++		} else if (draw != (cases[ci].expect != 0)) {
++			printf("SWEETMALI: IDX %s UNEXPECTED %s\n",
++			    cases[ci].name, draw ? "draw" : "empty");
++		} else {
++			printf("SWEETMALI: IDX %s UNEXPECTED fault state "
++			    "(mmu=%x want=%d)\n", cases[ci].name, mmu,
++			    mmu_want);
++		}
++	}
++
++	if (nok == ntests) {
++		printf("SWEETMALI: INDEX PASS (%u/%u cases, the index buffer "
++		    "drives the triangle)\n", nok, ntests);
++		return 0;
++	}
++	printf("SWEETMALI: INDEX FAIL (%u/%u cases)\n", nok, ntests);
++	return -1;
++}
++
++static boolean_t
++sm_map(void)
++{
++	sm.gpu = ml_io_map(SM_GPU_PA, SM_GPU_SIZE);
++	sm.mfg = ml_io_map(SM_MFG_PA, SM_MMIO_SIZE);
++	sm.scpsys = ml_io_map(SM_SCPSYS_PA, SM_MMIO_SIZE);
++	sm.infra = ml_io_map(SM_INFRA_PA, SM_MMIO_SIZE);
++	sm.top = ml_io_map(SM_TOP_PA, SM_MMIO_SIZE);
++	sm.apmixed = ml_io_map(SM_APMIXED_PA, SM_MMIO_SIZE);
++
++	if (!sm.gpu || !sm.mfg || !sm.scpsys || !sm.infra || !sm.top ||
++	    !sm.apmixed) {
++		printf("SWEETMALI: MMIO mapping failed gpu=%lx mfg=%lx sleep=%lx "
++		    "infra=%lx top=%lx apmixed=%lx\n",
++		    sm.gpu, sm.mfg, sm.scpsys, sm.infra, sm.top, sm.apmixed);
++		return FALSE;
++	}
++	printf("SWEETMALI: MMIO gpu=%lx mfg=%lx sleep=%lx infra=%lx top=%lx "
++	    "apmixed=%lx\n", sm.gpu, sm.mfg, sm.scpsys, sm.infra, sm.top,
++	    sm.apmixed);
++	return TRUE;
++}
++
++static void
++sweet_mali_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 0;
++	int rc;
++
++	(void)arg;
++	(void)result;
++
++	(void)PE_parse_boot_argn("sweetmalidelay", &delay_s, sizeof(delay_s));
++	if (delay_s > 60u) {
++		delay_s = 60u;
++	}
++	if (delay_s) {
++		printf("SWEETMALI: starting in %u s\n", delay_s);
++		/* delay() takes microseconds, so seconds * 1e6. */
++		delay(delay_s * 1000000u);
++	}
++
++	printf("SWEETMALI: bring-up start\n");
++	if (!sm_map()) {
++		goto out;
++	}
++
++	rc = sm_power_and_clock();
++	if (rc) {
++		printf("SWEETMALI: power/clock failed rc=%d\n", -rc);
++		goto out;
++	}
++
++	sm_disable_acp();
++
++	rc = sm_soft_reset();
++	if (rc) {
++		printf("SWEETMALI: reset failed rc=%d\n", -rc);
++		goto out;
++	}
++
++	sm_read_features();
++	sm_apply_g57_quirks();
++
++	rc = sm_power_units_on();
++	if (rc) {
++		printf("SWEETMALI: internal power failed rc=%d\n", -rc);
++		goto out;
++	}
++
++	sm.ready = TRUE;
++	printf("SWEETMALI: Mali-G57 ready (model %x rev %x)\n",
++	    sm.gpu_id, sm.revision);
++
++	rc = sm_mmu_init();
++	if (rc) {
++		printf("SWEETMALI: MMU init failed rc=%d\n", -rc);
++		goto out;
++	}
++	rc = sm_write_value_test();
++	if (rc) {
++		printf("SWEETMALI: write-value test failed rc=%d\n", -rc);
++		goto out;
++	}
++	printf("SWEETMALI: MMU + write-value PASS\n");
++
++	rc = sm_triangle_demo();
++	if (rc) {
++		printf("SWEETMALI: panel triangle failed rc=%d\n", -rc);
++		goto out;
++	}
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_mali_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (sm.started) {
++		return;
++	}
++	sm.started = TRUE;
++
++	(void)PE_parse_boot_argn("sweetmali", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEETMALI: disabled (sweetmali=0)\n");
++		return;
++	}
++
++	kr = kernel_thread_start(sweet_mali_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEETMALI: kernel_thread_start failed %d\n", kr);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_mali.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
