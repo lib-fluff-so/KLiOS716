@@ -1,0 +1,902 @@
+diff --git a/bsd/sys/sweet_mali_abi.h b/bsd/sys/sweet_mali_abi.h
+new file mode 100644
+index 0000000..e0398bd
+--- /dev/null
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -0,0 +1,114 @@
++/*
++ * SweetMali ABI: what a client process may ask the Mali-G57 kernel service for.
++ *
++ * This header is deliberately free of kernel types -- no `sys/`, no IOKit --
++ * so that the same file compiles in the kernel (the user client's handlers)
++ * and in userspace (the libdrm stand-in that D/F builds over the IOKit
++ * connection, modelled on gpu/freedreno-sweet/sweet_drm.c in the bergamota
++ * tree).  When that stand-in lands, this file is copied into the userspace
++ * tree; until then the kernel copy under bsd/sys is the only one, and the
++ * client program includes it by path.
++ *
++ * The shape follows bergamota's xnu/gpu-abi/sweet_adreno_abi.h, which is
++ * proven on hardware: selectors are small integers, arguments travel as a
++ * struct through IOConnectCallStructMethod, and the selector number for the
++ * GPU calls is the panfrost ioctl number they stand in for, so the userspace
++ * marshaller stays a table lookup rather than a translation layer.
++ *
++ * A note on `struct sm_get_param`: the fields are ordered to match the DRM
++ * struct it stands in for (struct drm_panfrost_get_param), i.e. two 32-bit
++ * fields and then a 64-bit value, which on arm64 means an 8-byte alignment
++ * hole after `param` and before `value`.  That hole is spelled out as `pad`
++ * rather than left to the compiler so the kernel and the client cannot
++ * disagree about the layout.
++ */
++#ifndef _BSD_DEV_SWEET_MALI_ABI_H_
++#define _BSD_DEV_SWEET_MALI_ABI_H_
++
++#ifndef SM_ABI_STANDALONE
++#include <stdint.h>
++#else
++#include <stdint.h>
++#endif
++
++/* Bumped when a struct below changes meaning; GET_PARAM VERSION returns it. */
++#define SM_ABI_VERSION          1u
++
++/*
++ * Selectors.  The first block mirrors DRM_IOCTL_PANFROST_*; the second is
++ * SweetMali's own (there is no DRM ioctl behind it, the port has no DRM).
++ */
++#define SM_SEL_VERSION          0x00u   /* out: struct sm_abi_info */
++#define SM_SEL_GET_PARAM        0x01u   /* in/out: struct sm_get_param */
++
++/* The service's class name in the IORegistry, and its user client class. */
++#define SM_SERVICE_NAME         "SweetMali"
++#define SM_USER_CLIENT_CLASS    "SweetMaliUserClient"
++
++struct sm_abi_info {
++	uint32_t abi_version;   /* SM_ABI_VERSION */
++	uint32_t ready;         /* 1 = bring-up finished, GPU powered; 0 = not */
++};
++
++/*
++ * Param ids: the order is `include/drm-uapi/panfrost_drm.h`'s unnamed enum
++ * (DRM_PANFROST_PARAM_GPU_PROD_ID = 0, ...), so a client that knows upstream's
++ * numbering does not need a translation table.  Ids the driver cannot answer
++ * return kIOReturnUnsupported rather than a wrong number -- an absent feature
++ * and a feature that reads as zero are different facts, and a client that
++ * cannot tell them apart will mis-detect the GPU.
++ */
++#define SM_PARAM_GPU_PROD_ID                0u
++#define SM_PARAM_GPU_REVISION               1u
++#define SM_PARAM_SHADER_PRESENT             2u
++#define SM_PARAM_TILER_PRESENT              3u
++#define SM_PARAM_L2_PRESENT                 4u
++#define SM_PARAM_STACK_PRESENT              5u
++#define SM_PARAM_AS_PRESENT                 6u
++#define SM_PARAM_JS_PRESENT                 7u
++#define SM_PARAM_L2_FEATURES                8u
++#define SM_PARAM_CORE_FEATURES              9u
++#define SM_PARAM_TILER_FEATURES             10u
++#define SM_PARAM_MEM_FEATURES               11u
++#define SM_PARAM_MMU_FEATURES               12u
++#define SM_PARAM_THREAD_FEATURES            13u
++#define SM_PARAM_MAX_THREADS                14u
++#define SM_PARAM_THREAD_MAX_WORKGROUP_SZ    15u
++#define SM_PARAM_THREAD_MAX_BARRIER_SZ      16u
++#define SM_PARAM_COHERENCY_FEATURES         17u
++#define SM_PARAM_TEXTURE_FEATURES0          18u
++#define SM_PARAM_TEXTURE_FEATURES1          19u
++#define SM_PARAM_TEXTURE_FEATURES2          20u
++#define SM_PARAM_TEXTURE_FEATURES3          21u
++#define SM_PARAM_JS_FEATURES0               22u
++#define SM_PARAM_JS_FEATURES1               23u
++#define SM_PARAM_JS_FEATURES2               24u
++#define SM_PARAM_JS_FEATURES3               25u
++#define SM_PARAM_JS_FEATURES4               26u
++#define SM_PARAM_JS_FEATURES5               27u
++#define SM_PARAM_JS_FEATURES6               28u
++#define SM_PARAM_JS_FEATURES7               29u
++#define SM_PARAM_JS_FEATURES8               30u
++#define SM_PARAM_JS_FEATURES9               31u
++#define SM_PARAM_JS_FEATURES10              32u
++#define SM_PARAM_JS_FEATURES11              33u
++#define SM_PARAM_JS_FEATURES12              34u
++#define SM_PARAM_JS_FEATURES13              35u
++#define SM_PARAM_JS_FEATURES14              36u
++#define SM_PARAM_JS_FEATURES15              37u
++#define SM_PARAM_NR_CORE_GROUPS             38u
++#define SM_PARAM_THREAD_TLS_ALLOC           39u
++#define SM_PARAM_AFBC_FEATURES              40u
++#define SM_PARAM_SYSTEM_TIMESTAMP           41u
++#define SM_PARAM_SYSTEM_TIMESTAMP_FREQUENCY 42u
++/* SM_PARAM_ALLOWED_JM_CTX_PRIORITIES 43u -- no scheduler yet, unsupported */
++/* SM_PARAM_SELECTED_COHERENCY         44u -- no coherency protocol yet      */
++#define SM_PARAM_COUNT                      45u
++
++struct sm_get_param {
++	uint32_t param;         /* one of SM_PARAM_* */
++	uint32_t pad;           /* layout, not information */
++	uint64_t value;         /* out */
++};
++
++#endif /* _BSD_DEV_SWEET_MALI_ABI_H_ */
+
+diff --git a/bsd/sys/sweet_mali.h b/bsd/sys/sweet_mali.h
+new file mode 100644
+index 0000000..a82007d
+--- /dev/null
++++ b/bsd/sys/sweet_mali.h
+@@ -0,0 +1,77 @@
++/*
++ * SweetMali: the core driver's exported face.
++ *
++ * bsd/dev/sweet_mali.c owns everything hardware-risky -- power, the MMU and
++ * its table pool, the VA allocator, BOs, job submission and shader packing --
++ * and it runs its own probe suite from a kernel thread.  This header is the
++ * only thing the IOKit layer (iokit/Kernel/arm/SweetMali.cpp) is allowed to
++ * know about it, so that the two can be reasoned about, and reverted,
++ * separately.
++ *
++ * The value table is indexed by the ABI's param ids on purpose.  The
++ * alternative -- a switch in the user client with 45 cases, and a struct with
++ * 45 named fields in the core -- has the same information written down twice,
++ * and the two halves drift the first time a register is added.  Here the core
++ * fills `param[]` next to the register it reads (so the mapping is visible in
++ * one place, in the order of the datasheet), and `valid` is a bitmap that says
++ * which of those entries the core actually answered, so "this GPU has no such
++ * parameter" is data rather than a code path.
++ */
++#ifndef _BSD_DEV_SWEET_MALI_H_
++#define _BSD_DEV_SWEET_MALI_H_
++
++#include <sys/types.h>
++#include <stdint.h>
++
++/*
++ * In bsd/sys, not bsd/dev, because both halves include it: the C core
++ * (bsd/dev/sweet_mali.c) and the C++ IOKit service, whose include path has only
++ * the exported BSD headers (EXPORT_HDRS/bsd) and therefore cannot see
++ * bsd/dev/*.h at all.  bsd/sys is where the port already keeps headers that
++ * more than one part of the kernel includes (pthread_internal.h,
++ * uio_internal.h), and those are exported by the same step.
++ */
++#include <sys/sweet_mali_abi.h>
++
++#ifdef __cplusplus
++/*
++ * The core is compiled as C and the IOKit layer as C++, so these two
++ * declarations need C linkage or the linker will look for a mangled name that
++ * no object file defines.
++ */
++extern "C" {
++#endif
++
++struct sm_gpu_info {
++	uint32_t abi_version;           /* SM_ABI_VERSION */
++	uint32_t ready;                 /* 1 = bring-up finished, GPU powered  */
++	uint64_t valid;                 /* bit n: param[n] holds a real answer */
++	uint64_t param[SM_PARAM_COUNT]; /* indexed by SM_PARAM_* */
++};
++
++/*
++ * Read the GPU's identity and feature registers and fill `out`.  Safe to call
++ * from anywhere once bring-up has finished: it only reads the MMIO window the
++ * bring-up already mapped, and the GPU keeps those registers powered as long
++ * as it is on.
++ */
++void sm_gpu_info_read(struct sm_gpu_info *out);
++
++/* 1 once bring-up has finished and the GPU is powered and idle. */
++int sm_gpu_ready(void);
++
++/*
++ * Stage D1's self-test: the "UC" stage of the probe suite.  It is defined in
++ * iokit/Kernel/arm/SweetMali.cpp and not in the core, because it calls C++
++ * members -- IOService::waitForService(), newUserClient(),
++ * IOUserClient::externalMethod() -- and the core is compiled as C.  The core's
++ * probe thread calls it after the GPU suite passes; on a board without the
++ * service it is a no-op.
++ */
++void sweet_mali_uc_test(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _BSD_DEV_SWEET_MALI_H_ */
+
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+new file mode 100644
+index 0000000..499c7f1
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -0,0 +1,491 @@
++/*
++ * SweetMali IOKit surface: the service and the user client, stage D1.
++ *
++ * The GPU itself is bsd/dev/sweet_mali.c; this file is only the door.  It
++ * exists because the next stages need a client to own GPU memory and hand the
++ * kernel a job descriptor (D2), and because the panfrost userspace that F
++ * builds talks to the kernel through a connection like this one.
++ *
++ * How a class like this gets instantiated without a kext: IOKit parses
++ * iokit/KernelConfigTables.cpp's gIOKernelConfigTables as the built-in
++ * personality list, so a container there
++ *
++ *     "   {"
++ *     "     'IOClass'         = SweetMali;"
++ *     "     'IOProviderClass' = IOResources;"
++ *     "     'IOMatchCategory' = SweetMali;"
++ *     "   },"
++ *
++ * makes IOKit create one SweetMali with IOResources as its provider, call
++ * start() on it, and (because start() sets IOUserClientClass) instantiate
++ * SweetMaliUserClient for every IOServiceOpen on it.  This is how the port
++ * already carries AppleKeyStore, IOWatchdog, IOCoreSurfaceRoot and the HID
++ * services, so there is no new mechanism here, only a new user of one.
++ *
++ * The client is deliberately not a MIG subsystem.  Selectors are small
++ * integers and arguments are structs, exactly like bergamota's
++ * sweet_adreno_abi.h, so the userspace side is IOConnectCallStructMethod and
++ * nothing else, and the kernel side is a switch that can be read top to
++ * bottom.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <sys/proc.h>
++#include <kern/task.h>		/* current_task(), for newUserClient() */
++#include <string.h>		/* memset/memcpy in the argument plumbing */
++
++#include <sys/sweet_mali.h>
++
++#define SM_LOG(fmt, ...)  IOLog("SWEETMALI UC: " fmt, ##__VA_ARGS__)
++
++/* ------------------------------------------------------------------ *
++ * The service
++ * ------------------------------------------------------------------ */
++
++class SweetMali : public IOService {
++	OSDeclareDefaultStructors(SweetMali);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++
++	/*
++	 * The client asks the service, not the core, whether the GPU is up, so
++	 * that a boot with the GPU disabled (sweetmali=0) still has a service
++	 * to open -- and so that "the service exists" and "the GPU works" stay
++	 * two different facts in the log.
++	 */
++	bool gpuReady(void) const;
++};
++
++OSDefineMetaClassAndStructors(SweetMali, IOService);
++
++bool
++SweetMali::gpuReady(void) const
++{
++	return sm_gpu_ready() != 0;
++}
++
++bool
++SweetMali::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, SM_USER_CLIENT_CLASS);
++	registerService();
++	SM_LOG("service registered (%s, gpu %s)\n", SM_SERVICE_NAME,
++	    gpuReady() ? "ready" : "not up");
++	return true;
++}
++
++void
++SweetMali::stop(IOService *provider)
++{
++	SM_LOG("service stopping\n");
++	IOService::stop(provider);
++}
++
++/* ------------------------------------------------------------------ *
++ * The user client
++ * ------------------------------------------------------------------ */
++
++class SweetMaliUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetMaliUserClient);
++
++	SweetMali *fProvider;
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID,
++	    uint32_t type) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(uint32_t type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetMaliUserClient, IOUserClient);
++
++bool
++SweetMaliUserClient::initWithTask(task_t owningTask, __unused void *securityID,
++    __unused uint32_t type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fProvider = NULL;
++	return true;
++}
++
++bool
++SweetMaliUserClient::start(IOService *provider)
++{
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	fProvider = OSDynamicCast(SweetMali, provider);
++	if (fProvider == NULL) {
++		return false;
++	}
++	SM_LOG("client opened\n");
++	return true;
++}
++
++IOReturn
++SweetMaliUserClient::clientClose(void)
++{
++	/*
++	 * Terminate ourselves like the port's other clients do.  Nothing to
++	 * tear down for D1; D2 will need to release the client's BOs here,
++	 * before the task disappears, because a BO's memory is the client's
++	 * and the GPU is still pointed at it.
++	 */
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/*
++ * D2's door: a client will map its own GPU memory through a type here.
++ * Refusing with kIOReturnUnsupported until then is deliberate -- a client
++ * that gets a mapping it cannot trust is worse than one that gets an error.
++ */
++IOReturn
++SweetMaliUserClient::clientMemoryForType(__unused uint32_t type,
++    __unused IOOptionBits *options, __unused IOMemoryDescriptor **memory)
++{
++	return kIOReturnUnsupported;
++}
++
++/* ---- argument plumbing ------------------------------------------- */
++
++/*
++ * Struct arguments arrive in two forms: in band (the small-buffer case, the
++ * pointers are in the mach message) or out of line (the large-buffer case, a
++ * memory descriptor describes the client's pages).  Both are legal for any
++ * size, so a handler that only reads one of them works until a client happens
++ * to send a bigger struct, and then fails in a way that looks like a protocol
++ * bug.  These two helpers make every selector handle both.
++ */
++static IOReturn
++sm_uc_in(IOExternalMethodArguments *args, void *buf, size_t len)
++{
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->getLength() < len) {
++			return kIOReturnBadArgument;
++		}
++		if (args->structureInputDescriptor->readBytes(0, buf, len) != len) {
++			return kIOReturnBadArgument;
++		}
++		return kIOReturnSuccess;
++	}
++	if (args->structureInput == NULL || args->structureInputSize < len) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(buf, args->structureInput, len);
++	return kIOReturnSuccess;
++}
++
++static IOReturn
++sm_uc_out(IOExternalMethodArguments *args, const void *buf, size_t len)
++{
++	if (args->structureOutputDescriptor != NULL) {
++		if (args->structureOutputDescriptor->getLength() < len) {
++			return kIOReturnNoSpace;
++		}
++		if (args->structureOutputDescriptor->writeBytes(0, buf, len) != len) {
++			return kIOReturnNoSpace;
++		}
++		args->structureOutputDescriptorSize = (uint32_t)len;
++		return kIOReturnSuccess;
++	}
++	if (args->structureOutput == NULL || args->structureOutputSize < len) {
++		return kIOReturnNoSpace;
++	}
++	memcpy(args->structureOutput, buf, len);
++	args->structureOutputSize = (uint32_t)len;
++	return kIOReturnSuccess;
++}
++
++/* ---- the selectors ----------------------------------------------- */
++
++/*
++ * VERSION: the ABI this kernel speaks and whether the GPU came up.  This is
++ * the first call a client makes, and the reason it is a struct rather than a
++ * pair of scalars is that `ready` can change between a boot where the GPU
++ * failed and one where it did not without the ABI version changing.
++ */
++static IOReturn
++sm_uc_version(IOExternalMethodArguments *args)
++{
++	struct sm_abi_info info;
++
++	info.abi_version = SM_ABI_VERSION;
++	info.ready = sm_gpu_ready() ? 1u : 0u;
++	return sm_uc_out(args, &info, sizeof(info));
++}
++
++/*
++ * GET_PARAM: one GPU identity or feature register, by upstream's param id.
++ *
++ * The core answers with a bitmap of the params it filled, so an id this port
++ * cannot answer -- the scheduler priority list, the selected coherency
++ * protocol, a timestamp -- comes back as kIOReturnUnsupported.  That matters
++ * for the userspace half: a panfrost build that reads a feature as 0 concludes
++ * the GPU lacks it, which is a different thing from the kernel not being asked
++ * the right question, and only the kernel can tell them apart.
++ */
++static IOReturn
++sm_uc_get_param(IOExternalMethodArguments *args)
++{
++	struct sm_gpu_info info;
++	struct sm_get_param p;
++	IOReturn ret;
++
++	ret = sm_uc_in(args, &p, sizeof(p));
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	sm_gpu_info_read(&info);
++	if (p.param >= SM_PARAM_COUNT) {
++		return kIOReturnUnsupported;
++	}
++	if ((info.valid & (1ull << p.param)) == 0) {
++		return kIOReturnUnsupported;
++	}
++	p.value = info.param[p.param];
++	p.pad = 0;
++	return sm_uc_out(args, &p, sizeof(p));
++}
++
++IOReturn
++SweetMaliUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
++    __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case SM_SEL_VERSION:
++		return sm_uc_version(args);
++	case SM_SEL_GET_PARAM:
++		return sm_uc_get_param(args);
++	default:
++		/*
++		 * Log the first time an unknown selector is used, like the
++		 * port's other clients: a mistyped selector in a userspace
++		 * build is otherwise indistinguishable from a kernel that
++		 * refuses everything.
++		 */
++		if (selector < 64u) {
++			static uint64_t seen;
++
++			if ((seen & (1ull << selector)) == 0) {
++				seen |= 1ull << selector;
++				SM_LOG("selector %u unsupported\n", selector);
++			}
++		}
++		return kIOReturnUnsupported;
++	}
++}
++
++/* ------------------------------------------------------------------ *
++ * The self-test: stage D1's "UC" stage of the probe suite
++ * ------------------------------------------------------------------ */
++
++/*
++ * Called from bsd/dev/sweet_mali.c at the end of the GPU suite, through the
++ * C-linkage declaration there -- everything below calls C++ members, so it
++ * cannot live in that file.
++ *
++ * What this can and cannot prove, stated up front because the difference
++ * decides how much the PASS is worth:
++ *
++ *   - it proves the personality in iokit/KernelConfigTables.cpp instantiated
++ *     the service ("service ... found");
++ *   - it proves IOUserClientClass routes IOServiceOpen to
++ *     SweetMaliUserClient, because it opens a client through the same
++ *     IOService::newUserClient() overload that the kernel's io_connect_method
++ *     calls -- the one that reads the property and runs allocClassWithName()
++ *     -> initWithTask() -> attach() -> start();
++ *   - it proves the dispatch: every selector goes through externalMethod() and
++ *     is answered out of the GPU's registers;
++ *   - it does NOT prove libSystem's marshalling, because there is no mach
++ *     message here.  That is F1's job (HANDOFF §19.5 is the open item about
++ *     getting a test binary onto the phone at all).
++ *
++ * The oracle is the core's own sm_gpu_info_read(): the client's answer must
++ * equal it value for value, and both sides are printed, so the ring can also be
++ * read against the bring-up lines (ID=90930010, L2_FEAT=8120206, ...).  A bug
++ * in a register read and a bug in the client path therefore look different:
++ * the first makes both disagree with the boot log, the second makes them
++ * disagree with each other.
++ */
++
++#define SM_UC_CALL(uc, sel, a) \
++	((uc)->externalMethod((sel), (a), NULL, NULL, NULL))
++
++extern "C" void
++sweet_mali_uc_test(void)
++{
++	OSDictionary *match;
++	IOService *svc;
++	IOUserClient *uc = NULL;
++	struct sm_gpu_info gpu;
++	struct sm_abi_info abi;
++	struct sm_get_param p;
++	IOExternalMethodArguments args;
++	kern_return_t kr;
++	uint32_t nok = 0, ntest = 0, nbad = 0;
++	uint32_t id;
++
++	SM_LOG("---- stage D1 ----\n");
++
++	/* 1. the service the personality should have created */
++	match = IOService::serviceMatching(SM_SERVICE_NAME);
++	if (match == NULL) {
++		SM_LOG("serviceMatching(%s) failed\n", SM_SERVICE_NAME);
++		return;
++	}
++	svc = IOService::waitForService(match);	/* consumes the dictionary */
++	if (svc == NULL) {
++		SM_LOG("service %s NOT FOUND (personality missing?)\n",
++		    SM_SERVICE_NAME);
++		return;
++	}
++	ntest++;
++	nok++;
++	SM_LOG("service %s found\n", SM_SERVICE_NAME);
++
++	/* 2. the client, opened the way IOServiceOpen opens one */
++	kr = svc->newUserClient(current_task(), NULL, 0u, NULL, &uc);
++	if (kr != kIOReturnSuccess || uc == NULL) {
++		SM_LOG("client kr=%x not created "
++		    "(IOUserClientClass property?)\n", kr);
++		SM_LOG("FAIL (%u/%u)\n", nok, ntest + 1);
++		return;
++	}
++	ntest++;
++	nok++;
++	SM_LOG("client opened\n");
++
++	/* 3. VERSION: the struct every client starts with */
++	memset(&abi, 0, sizeof(abi));
++	memset(&args, 0, sizeof(args));
++	args.version = kIOExternalMethodArgumentsCurrentVersion;
++	args.structureOutput = &abi;
++	args.structureOutputSize = sizeof(abi);
++	kr = SM_UC_CALL(uc, SM_SEL_VERSION, &args);
++	ntest++;
++	if (kr == kIOReturnSuccess && abi.abi_version == SM_ABI_VERSION) {
++		nok++;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s VERSION abi=%u want=%u ready=%u kr=%x\n",
++	    (kr == kIOReturnSuccess && abi.abi_version == SM_ABI_VERSION) ?
++	    "ok " : "BAD", abi.abi_version, SM_ABI_VERSION, abi.ready, kr);
++
++	/*
++	 * 4. every param: the client's value must equal the core's.  Ids the
++	 *    core does not answer must come back refused -- answering them
++	 *    with 0 would tell userspace the GPU lacks the feature, which is a
++	 *    different (and wrong) fact.
++	 */
++	sm_gpu_info_read(&gpu);
++	for (id = 0; id < SM_PARAM_COUNT; id++) {
++		bool want = (gpu.valid & (1ull << id)) != 0;
++		bool ok;
++
++		p.param = id;
++		p.pad = 0;
++		p.value = 0;
++		memset(&args, 0, sizeof(args));
++		args.version = kIOExternalMethodArgumentsCurrentVersion;
++		args.structureInput = &p;
++		args.structureInputSize = sizeof(p);
++		args.structureOutput = &p;
++		args.structureOutputSize = sizeof(p);
++		kr = SM_UC_CALL(uc, SM_SEL_GET_PARAM, &args);
++
++		ntest++;
++		if (!want) {
++			ok = (kr == kIOReturnUnsupported);
++		} else {
++			ok = (kr == kIOReturnSuccess && p.value == gpu.param[id]);
++		}
++		if (ok) {
++			nok++;
++		} else {
++			nbad++;
++		}
++		SM_LOG("%s param %2u value=%llx want=%llx kr=%x\n",
++		    ok ? "ok " : "BAD", id, (unsigned long long)p.value,
++		    (unsigned long long)gpu.param[id], kr);
++	}
++
++	/* 5. out of range must be refused rather than answered */
++	p.param = SM_PARAM_COUNT;
++	p.value = 0;
++	memset(&args, 0, sizeof(args));
++	args.version = kIOExternalMethodArgumentsCurrentVersion;
++	args.structureInput = &p;
++	args.structureInputSize = sizeof(p);
++	args.structureOutput = &p;
++	args.structureOutputSize = sizeof(p);
++	kr = SM_UC_CALL(uc, SM_SEL_GET_PARAM, &args);
++	ntest++;
++	if (kr == kIOReturnUnsupported) {
++		nok++;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s param %u out of range: kr=%x\n",
++	    kr == kIOReturnUnsupported ? "ok " : "BAD", SM_PARAM_COUNT, kr);
++
++	/* 6. a selector nobody implements must be refused, not ignored */
++	memset(&args, 0, sizeof(args));
++	args.version = kIOExternalMethodArgumentsCurrentVersion;
++	kr = SM_UC_CALL(uc, 0x7eu, &args);
++	ntest++;
++	if (kr == kIOReturnUnsupported) {
++		nok++;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s unknown selector 0x7e: kr=%x\n",
++	    kr == kIOReturnUnsupported ? "ok " : "BAD", kr);
++
++	/*
++	 * The teardown a real close uses, in order: close the connection (our
++	 * clientClose() terminates the client), then drop the reference
++	 * newUserClient() returned retained.
++	 */
++	uc->clientClose();
++	uc->release();
++
++	SM_LOG("%s (%u/%u%s)\n", (nok == ntest && nbad == 0) ? "PASS" : "FAIL",
++	    nok, ntest, nbad ? ", see BAD lines above" : "");
++}
++
++#else /* !ARM64_BOARD_CONFIG_SWEET */
++
++/*
++ * bsd/dev/sweet_mali.c is unconditional (bsd/conf/files: "standard"), so its
++ * stage D1 call is compiled on every board.  On a board that has no SweetMali
++ * service -- any of the Apple boards this tree can still be built for -- the
++ * stage is a no-op instead of an undefined reference at link time.
++ */
++extern "C" void
++sweet_mali_uc_test(void)
++{
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -30,12 +30,25 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <IOKit/IOLib.h>
++/*
++ * memset, for sm_gpu_info_read() below: named explicitly instead of relying on
++ * it arriving transitively, the way bsd/kern/kern_event.c does it.
++ */
++#include <string.h>
++/*
++ * The ABI and this driver's exported face (stage D1).  It is in bsd/sys
++ * because the IOKit half is C++ and can only see the exported BSD headers;
++ * see the comment at the top of the header.
++ */
++#include <sys/sweet_mali.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_console_muted;	/* osfmk/console/serial_console.c */
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_mali_init(void);
++/* Stage D1's self-test is declared in <sys/sweet_mali.h>, which this file
++ * includes; it is defined in the C++ half for the reason given there. */
+ 
+ /* Physical addresses on MT6789 (from the live DTB and the shim log). */
+ #define SM_GPU_PA       0x13000000u
+@@ -861,6 +874,102 @@
+ 	    sm_rd(sm.gpu + SM_GPU_JS_FEATURES(3)));
+ 	printf("SWEETMALI: TLS_ALLOC=%x\n",
+ 	    sm_rd(sm.gpu + SM_GPU_THREAD_TLS_ALLOC));
++}
++
++/*
++ * The IOKit layer's view of the GPU (stage D1).  Two insertions, described in
++ * NOTES.md: the include, and this block right after sm_read_features()'s
++ * closing brace.
++ *
++ * Nothing is cached at bring-up: a client that asks after a failed boot gets
++ * the live answer, and the two facts the ABI keeps apart -- the GPU is up, and
++ * this port knows the value -- stay apart.  `valid` is a bitmap rather than a
++ * sentinel because 0 is a legal register value on this GPU (CORE_FEATURES is
++ * 0), so "no such parameter" cannot be spelled as zero.
++ */
++void
++sm_gpu_info_read(struct sm_gpu_info *out)
++{
++	uint64_t valid = 0;
++	uint32_t n;
++
++	memset(out, 0, sizeof(*out));
++	out->abi_version = SM_ABI_VERSION;
++	out->ready = sm.ready ? 1u : 0u;
++
++	/*
++	 * If the MMIO window was never mapped there is nothing to read, and
++	 * reading it anyway would fault inside a user client call: leave every
++	 * param invalid and let the client see an unsupported call instead.
++	 */
++	if (sm.gpu == 0) {
++		return;
++	}
++
++	/*
++	 * One line per param, in the ABI's order, each next to the register it
++	 * comes from.  sm_read_features() printed these same registers a few
++	 * lines above, so a wrong value here is found by reading the two
++	 * side by side in the ring.
++	 */
++	out->param[SM_PARAM_GPU_PROD_ID] = sm.gpu_id;
++	out->param[SM_PARAM_GPU_REVISION] = sm.revision;
++	out->param[SM_PARAM_SHADER_PRESENT] = sm.shader_present;
++	out->param[SM_PARAM_TILER_PRESENT] = sm.tiler_present;
++	out->param[SM_PARAM_L2_PRESENT] = sm.l2_present;
++	out->param[SM_PARAM_STACK_PRESENT] = sm_rd(sm.gpu + SM_GPU_STACK_PRESENT_LO);
++	out->param[SM_PARAM_AS_PRESENT] = sm.as_present;
++	out->param[SM_PARAM_JS_PRESENT] = sm.js_present;
++	out->param[SM_PARAM_L2_FEATURES] = sm_rd(sm.gpu + SM_GPU_L2_FEATURES);
++	out->param[SM_PARAM_CORE_FEATURES] = sm_rd(sm.gpu + SM_GPU_CORE_FEATURES);
++	out->param[SM_PARAM_TILER_FEATURES] = sm_rd(sm.gpu + SM_GPU_TILER_FEATURES);
++	out->param[SM_PARAM_MEM_FEATURES] = sm.mem_features;
++	out->param[SM_PARAM_MMU_FEATURES] = sm.mmu_features;
++	out->param[SM_PARAM_THREAD_FEATURES] = sm.thread_features;
++	out->param[SM_PARAM_MAX_THREADS] = sm.max_threads;
++	out->param[SM_PARAM_THREAD_MAX_WORKGROUP_SZ] = sm.max_workgroup;
++	out->param[SM_PARAM_THREAD_MAX_BARRIER_SZ] = sm.max_barrier;
++	out->param[SM_PARAM_COHERENCY_FEATURES] = sm.coherency_features;
++	for (n = 0; n < 4u; n++) {
++		out->param[SM_PARAM_TEXTURE_FEATURES0 + n] =
++		    sm_rd(sm.gpu + SM_GPU_TEXTURE_FEATURES(n));
++	}
++	/*
++	 * The JS block has 16 slots; the bring-up log only prints the first
++	 * four because those are the populated ones on a G57, but reading all
++	 * sixteen costs nothing and answers with what the hardware says rather
++	 * than with what this port expects.
++	 */
++	for (n = 0; n < 16u; n++) {
++		out->param[SM_PARAM_JS_FEATURES0 + n] =
++		    sm_rd(sm.gpu + SM_GPU_JS_FEATURES(n));
++	}
++	/*
++	 * panfrost's core_group_count: one group per L2 slice present.
++	 * L2_PRESENT is a bitmap, so the count is its population -- 1 on this
++	 * part (L2=1), i.e. a single core group.
++	 */
++	out->param[SM_PARAM_NR_CORE_GROUPS] = (uint64_t)__builtin_popcount(sm.l2_present);
++	out->param[SM_PARAM_THREAD_TLS_ALLOC] = sm_rd(sm.gpu + SM_GPU_THREAD_TLS_ALLOC);
++	out->param[SM_PARAM_AFBC_FEATURES] = sm_rd(sm.gpu + SM_GPU_AFBC_FEATURES);
++
++	for (n = SM_PARAM_GPU_PROD_ID; n <= SM_PARAM_AFBC_FEATURES; n++) {
++		valid |= 1ull << n;
++	}
++	/*
++	 * SYSTEM_TIMESTAMP and ..._FREQUENCY stay out of `valid`: panfrost's
++	 * timestamp is the GPU's own cycle counter, and this port has no
++	 * timestamp source wired to it yet.  Answering 0 would tell a client
++	 * the clock is stopped rather than missing.
++	 */
++	out->valid = valid;
++}
++
++int
++sm_gpu_ready(void)
++{
++	/* sm.ready is set once the units are powered and the features read. */
++	return sm.ready ? 1 : 0;
+ }
+ 
+ static void
+@@ -3600,6 +3709,18 @@
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Stage D1: the IOKit door.  It runs after the GPU suite on purpose --
++	 * the suite is what proves the hardware, this stage only proves that a
++	 * client can reach it -- and it is a separate stage rather than an sm
++	 * case because it submits no GPU work: the service, the client and the
++	 * param calls are exercised and the GPU is only read.  It is called
++	 * after the suite has already passed because a client that gets its
++	 * parameters from a GPU that did not come up would be testing the
++	 * wrong thing.
++	 */
++	sweet_mali_uc_test();
++
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+
+diff --git a/bsd/sys/Makefile b/bsd/sys/Makefile
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -242,6 +242,8 @@
+ 	pthread_internal.h \
+ 	resourcevar.h \
+ 	semaphore.h \
++	sweet_mali.h \
++	sweet_mali_abi.h \
+ 	tree.h \
+ 	uio_internal.h \
+ 	ulock.h \
+
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -57,6 +57,17 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
++    /*
++     * SweetMali: the Mali-G57 service.  IOResources, like the clients above:
++     * the GPU was already brought up by the BSD init (sweet_ufs.c calls
++     * sweet_mali_init()), so this is about publishing a door to it, not about
++     * matching a device-tree node.
++     */
++    "   {"
++    "     'IOClass'         = SweetMali;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetMali;"
++    "   },"
+     "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetMali.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+
