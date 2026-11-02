@@ -1,0 +1,1241 @@
+diff --git a/bsd/sys/sweet_mali_abi.h b/bsd/sys/sweet_mali_abi.h
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -31,8 +31,12 @@
+ #include <stdint.h>
+ #endif
+ 
+-/* Bumped when a struct below changes meaning; GET_PARAM VERSION returns it. */
+-#define SM_ABI_VERSION          1u
++/*
++ * Bumped when a struct below changes meaning; GET_PARAM VERSION returns it.
++ * 2: D3 extends struct sm_submit (out_sync is an input fence handle now,
++ *    in_syncs[] was added) and adds the fence/wait/sync structs.
++ */
++#define SM_ABI_VERSION          2u
+ 
+ /*
+  * Selectors.  The first block mirrors DRM_IOCTL_PANFROST_*; the second is
+@@ -45,6 +49,12 @@
+ #define SM_SEL_GET_BO_OFFSET    0x03u   /* in/out: struct sm_get_bo_offset */
+ #define SM_SEL_CLOSE_BO         0x04u   /* in: struct sm_close_bo */
+ #define SM_SEL_SUBMIT           0x05u   /* in/out: struct sm_submit */
++/* Added by stage D3: fences, waits, cache sync. */
++#define SM_SEL_WAIT_BO          0x06u   /* in/out: struct sm_wait_bo */
++#define SM_SEL_SYNC_BO          0x07u   /* in: struct sm_sync_bo */
++#define SM_SEL_SYNCOBJ_CREATE   0x08u   /* in/out: struct sm_syncobj_create */
++#define SM_SEL_SYNCOBJ_DESTROY  0x09u   /* in: struct sm_syncobj_destroy */
++#define SM_SEL_SYNCOBJ_WAIT     0x0au   /* in/out: struct sm_syncobj_wait */
+ 
+ /* The service's class name in the IORegistry, and its user client class. */
+ #define SM_SERVICE_NAME         "SweetMali"
+@@ -117,13 +127,15 @@
+ };
+ 
+ /*
+- * D2: memory and submission.
++ * D2: memory and submission; D3: fences, waits and cache sync.
+  *
+  * These are the panfrost UAPI calls a first userspace needs, minus MMAP_BO:
+  *
+  *   SM_SEL_CREATE_BO      <- DRM_IOCTL_PANFROST_CREATE_BO
+  *   SM_SEL_GET_BO_OFFSET  <- DRM_IOCTL_PANFROST_GET_BO_OFFSET
+  *   SM_SEL_SUBMIT         <- DRM_IOCTL_PANFROST_SUBMIT
++ *   SM_SEL_WAIT_BO        <- DRM_IOCTL_PANFROST_WAIT_BO
++ *   SM_SEL_SYNC_BO        <- DRM_IOCTL_PANFROST_SYNC_BO
+  *   SM_SEL_CLOSE_BO       <- DRM_IOCTL_GEM_CLOSE (generic DRM, not panfrost)
+  *
+  * CREATE_BO hands back a handle and an mmap offset.  GET_BO_OFFSET answers
+@@ -133,11 +145,27 @@
+  * offset, not the GPU one; D2 reserves it because MMAP_BO is stage B2 and
+  * needs a real client task, so a client that does not map simply ignores it.
+  *
+- * SUBMIT carries the BO handles inline instead of through a pointer like
+- * drm_panfrost_submit, because our transport is a copied struct and not an
+- * ioctl with copy_from_user.  The userspace marshaller fills the array in the
+- * struct; the kernel never dereferences a user pointer.  A job that names
+- * more than SM_SUBMIT_MAX_BOS buffers is refused rather than truncated.
++ * SUBMIT carries the BO and sync handles inline instead of through pointers
++ * like drm_panfrost_submit, because our transport is a copied struct and not
++ * an ioctl with copy_from_user.  The userspace marshaller fills the arrays in
++ * the struct; the kernel never dereferences a user pointer.  A job that names
++ * more than SM_SUBMIT_MAX_BOS buffers or SM_SUBMIT_MAX_SYNCS in-fences is
++ * refused rather than truncated.
++ *
++ * D3 adds fences the way panfrost does, with one deliberate simplification:
++ * this driver still runs the job to completion inside SUBMIT (the polled wait
++ * the probe suite uses), so the out fence is signalled before SUBMIT returns
++ * and an in fence must already be signalled for the job to start.  That is a
++ * correct, if unambitious, implementation of the UAPI: a client that waits on
++ * the out fence succeeds, and a chain of submits that names the previous out
++ * fence as its in fence runs in order.  A real job queue (and therefore
++ * overlapping CPU/GPU work) belongs with the Mesa winsys in F2; nothing in
++ * this ABI changes when it arrives.
++ *
++ * Sync objects are SweetMali's own because the port has no DRM; the numbers
++ * and semantics are DRM's syncobj create/destroy/wait, with the handle inline.
++ * WAIT_BO and SYNC_BO keep panfrost's shapes (a BO plus a timeout; one BO and
++ * one cache op), but their pointers are inline too.
+  *
+  * On arm64 the layout has no implicit holes: every 64-bit field is 8-byte
+  * aligned and every gap is spelled `pad`, so the client and the kernel cannot
+@@ -145,6 +173,19 @@
+  */
+ #define SM_BO_PAGE_SIZE         0x1000u
+ #define SM_SUBMIT_MAX_BOS       8u
++#define SM_SUBMIT_MAX_SYNCS     8u
++#define SM_SYNCOBJ_MAX          16u
++
++/*
++ * timeout_ns is relative: 0 polls, >0 waits that many nanoseconds, <0 means
++ * "as long as this stage can": D3 caps an infinite wait at 10 s because a
++ * synchronous submit has no other thread that could ever signal the fence.
++ */
++#define SM_WAIT_INFINITE        (-1ll)
++
++/* sm_sync_bo.type: panfrost's PANFROST_BO_SYNC_* values. */
++#define SM_BO_SYNC_CPU_CACHE_FLUSH                      0u
++#define SM_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE       1u
+ 
+ struct sm_create_bo {
+ 	uint32_t size;          /* in: bytes, a multiple of SM_BO_PAGE_SIZE */
+@@ -165,6 +206,59 @@
+ 	uint32_t pad;
+ };
+ 
++/*
++ * D3: one sync object.  Creating one makes an unsignalled fence; a SUBMIT
++ * whose out_sync names it signals it when the job finishes -- or faults, or
++ * times out, because a fence that never signals is a hang and a failed job is
++ * still a finished job.  SUBMIT's return is where the error is reported.
++ *
++ * Handles start at 1: 0 in a submit means "no fence", so it cannot also name
++ * the first sync object.  This is the one place where SweetMali differs from
++ * DRM, where 0 is a legal handle; the userspace marshaller adds the offset.
++ */
++struct sm_syncobj_create {
++	uint32_t handle;        /* out */
++	uint32_t pad;
++};
++
++struct sm_syncobj_destroy {
++	uint32_t handle;        /* in */
++	uint32_t pad;
++};
++
++struct sm_syncobj_wait {
++	uint32_t handle;        /* in */
++	uint32_t pad;
++	int64_t timeout_ns;     /* in: relative; see SM_WAIT_INFINITE */
++	uint32_t signaled;      /* out: 1 = signalled, 0 = timed out */
++	uint32_t pad2;
++};
++
++/*
++ * WAIT_BO waits for the last SUBMIT that named the BO to finish.  In D3 the
++ * submit is synchronous, so a BO is only busy while another thread is inside
++ * SUBMIT; the call is still the shape panfrost's userspace expects.
++ */
++struct sm_wait_bo {
++	uint32_t handle;        /* in */
++	uint32_t pad;
++	int64_t timeout_ns;     /* in: relative; see SM_WAIT_INFINITE */
++	uint32_t signaled;      /* out: 1 = idle, 0 = timed out */
++	uint32_t pad2;
++};
++
++/*
++ * SYNC_BO performs cache maintenance on a range of a BO.  `size == 0` means
++ * "to the end of the BO".  One op per call; panfrost's array of ops becomes
++ * a loop in the userspace marshaller.
++ */
++struct sm_sync_bo {
++	uint32_t handle;        /* in */
++	uint32_t type;          /* in: SM_BO_SYNC_* */
++	uint32_t offset;        /* in: byte offset, must be < BO size */
++	uint32_t size;          /* in: bytes, 0 = to the end of the BO */
++};
++
+ struct sm_submit {
+ 	uint64_t jc;            /* in: GPU VA of a job descriptor in a BO */
+ 	uint32_t bo_count;      /* in: 1..SM_SUBMIT_MAX_BOS */
+@@ -172,7 +266,9 @@
+ 	uint32_t bo_handles[SM_SUBMIT_MAX_BOS]; /* in */
+ 	uint32_t rawstat;       /* out: JOB_INT_RAWSTAT, for diagnosis */
+ 	uint32_t pad2;
+-	uint64_t out_sync;      /* out: D3 fence; must be 0 on input until then */
++	uint64_t out_sync;      /* in: syncobj to signal, or 0 for none */
++	uint32_t in_sync_count; /* in: 0..SM_SUBMIT_MAX_SYNCS */
++	uint32_t in_syncs[SM_SUBMIT_MAX_SYNCS]; /* in: syncobjs to wait for */
+ };
+ 
+ #endif /* _BSD_DEV_SWEET_MALI_ABI_H_ */
+
+diff --git a/bsd/sys/sweet_mali.h b/bsd/sys/sweet_mali.h
+--- a/bsd/sys/sweet_mali.h
++++ b/bsd/sys/sweet_mali.h
+@@ -89,9 +89,44 @@
+ #define SM_SUBMIT_EJC          -3   /* jc is not inside a listed BO */
+ #define SM_SUBMIT_EGPUFAULT    -4   /* the job slot reported a fault */
+ #define SM_SUBMIT_ETIMEOUT     -5
++#define SM_SUBMIT_ESYNC        -6   /* an in-fence was not signalled in time */
+ 
+ int sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
++    uint32_t out_sync, const uint32_t *in_syncs, uint32_t in_count,
+     uint32_t *rawstat);
++
++/* ---- stage D3: fences, waits and cache sync ----------------------- */
++
++/*
++ * Status codes for the wait calls.  They are separate from SM_SUBMIT_* on
++ * purpose: a timeout is not a submit failure, it is an answer ("not yet").
++ */
++#define SM_WAIT_OK              0
++#define SM_WAIT_ETIMEDOUT      -1
++#define SM_WAIT_EBADARG        -2
++
++/*
++ * A sync object is an opaque handle into the core's fence table.  SUBMIT
++ * signals the out_sync handle when the job finishes, faults or times out;
++ * nothing else signals one in D3.  `sm_syncobj_close_all` is the client
++ * teardown, next to sm_bo_close_all.
++ */
++int sm_syncobj_create(uint32_t *handle);
++int sm_syncobj_destroy(uint32_t handle);
++int sm_syncobj_wait(uint32_t handle, int64_t timeout_ns, uint32_t *signaled);
++void sm_syncobj_close_all(void);
++
++/*
++ * WAIT_BO: wait until the last SUBMIT naming this BO has finished.  D3 runs
++ * submits to completion inside the call, so a BO is only busy while a
++ * concurrent submitter is inside the core; the busy flag is what makes the
++ * wait real rather than a constant success.
++ *
++ * SYNC_BO: cache clean (type 0) or clean+invalidate (type 1) over the range.
++ * `size == 0` means "to the end of the BO".
++ */
++int sm_bo_wait(uint32_t handle, int64_t timeout_ns, uint32_t *idle);
++int sm_bo_sync(uint32_t handle, uint32_t type, uint32_t offset, uint32_t size);
+ 
+ /*
+  * The IOKit self-test (stages D1 and D2): the "UC" stage of the probe suite.
+
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -279,6 +279,10 @@
+ 
+ #define SM_TIMEOUT_STEPS 100000u
+ #define SM_TIMEOUT_US    10u
++/* D3: how long SUBMIT waits for an in-fence the producer has not signalled. */
++#define SM_IN_SYNC_TIMEOUT_NS  100000000ll  /* 100 ms */
++/* D3: cap for SM_WAIT_INFINITE; see the ABI's timeout_ns note. */
++#define SM_SYNC_MAX_WAIT_US    10000000u    /* 10 s */
+ 
+ /*
+  * Mali pixel format for one per-vertex R32G32B32A32_FLOAT attribute:
+@@ -452,6 +456,14 @@
+ 	uint64_t size;
+ 	uint64_t gpu_va;
+ 	boolean_t used;
++	/* D3: set while a SUBMIT naming this BO is inside the core. */
++	boolean_t busy;
++};
++
++/* D3: one fence.  The handle is the table index; the only state is the flag. */
++struct sm_syncobj {
++	boolean_t used;
++	boolean_t signaled;
+ };
+ 
+ static struct sweet_mali {
+@@ -518,6 +530,8 @@
+ 	uint32_t va_used[SM_VA_BITMAP_WORDS];
+ 	/* B1: BO handle table. */
+ 	struct sm_bo bo[SM_BO_MAX];
++	/* D3: sync object (fence) handle table. */
++	struct sm_syncobj sync[SM_SYNCOBJ_MAX];
+ 
+ 	boolean_t ready;
+ 	boolean_t started;
+@@ -1087,6 +1101,28 @@
+ }
+ 
+ /*
++ * D3: the clean-only half of the pair, for SYNC_BO's
++ * SM_BO_SYNC_CPU_CACHE_FLUSH.  `dc cvac` writes the line back without
++ * dropping it, which is what "make the CPU's writes visible to the GPU"
++ * needs; the invalidate variant above is for "make the GPU's writes visible
++ * to the CPU", where a stale line in the cache would hide them.
++ */
++static void
++sm_cache_clean(vm_offset_t addr, vm_size_t size)
++{
++	const vm_offset_t line = 64;
++	vm_offset_t start = addr & ~(line - 1);
++	vm_offset_t end = (addr + size + line - 1) & ~(line - 1);
++	vm_offset_t p;
++
++	for (p = start; p < end; p += line) {
++		__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	__asm__ volatile("isb" ::: "memory");
++}
++
++/*
+  * Identity-map one naturally aligned 2 MiB block: IOVA == physical.  The
+  * descriptors must contain the physical addresses of the next-level tables,
+  * not their kernel virtual addresses.
+@@ -1685,6 +1721,7 @@
+ 	sm.bo[slot].size = size;
+ 	sm.bo[slot].gpu_va = va;
+ 	sm.bo[slot].used = TRUE;
++	sm.bo[slot].busy = FALSE;
+ 	return 0;
+ }
+ 
+@@ -1719,6 +1756,7 @@
+ 	bo->kva = 0;
+ 	bo->pa = 0;
+ 	bo->used = FALSE;
++	bo->busy = FALSE;
+ }
+ 
+ /* The BO's first page becomes a byte-exact copy of the descriptor page, so a
+@@ -1831,6 +1869,160 @@
+ 		return 0;
+ 	}
+ 	return sm.bo[handle].gpu_va;
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * D3: fences, waits and cache sync
++ * ---------------------------------------------------------------------------
++ *
++ * A sync object is a one-bit fence with an identity.  D3's submit is still
++ * synchronous -- sm_client_submit() polls the job slot to completion before it
++ * returns -- so a fence is signalled *before* the client can call WAIT.  The
++ * wait path exists anyway, and the D3 test exercises it on a fence that
++ * nobody has signalled yet, because the shape has to be right now: when F2
++ * puts a job queue behind SUBMIT, only sm_syncobj_signal() moves.
++ *
++ * The wait loop sleeps in 1 ms slices.  A negative timeout is capped at
++ * SM_SYNC_MAX_WAIT_US instead of blocking a kernel thread forever; a client
++ * that asks for "infinite" in D3 gets the cap, because no other thread can
++ * signal the fence while this one is inside a synchronous submit.
++ */
++static int
++sm_wait_bool(volatile boolean_t *flag, boolean_t want, int64_t timeout_ns,
++    uint32_t *ready)
++{
++	uint64_t remaining_us;
++
++	if (*flag == want) {
++		*ready = 1;
++		return SM_WAIT_OK;
++	}
++	if (timeout_ns < 0) {
++		remaining_us = SM_SYNC_MAX_WAIT_US;
++	} else {
++		remaining_us = (uint64_t)timeout_ns / 1000ull;
++		if (((uint64_t)timeout_ns % 1000ull) != 0) {
++			remaining_us++;
++		}
++	}
++	while (remaining_us > 0) {
++		uint32_t step = remaining_us > 1000u ? 1000u :
++		    (uint32_t)remaining_us;
++
++		delay(step);
++		remaining_us -= step;
++		if (*flag == want) {
++			*ready = 1;
++			return SM_WAIT_OK;
++		}
++	}
++	*ready = 0;
++	return SM_WAIT_ETIMEDOUT;
++}
++
++int
++sm_syncobj_create(uint32_t *handle)
++{
++	uint32_t slot;
++
++	if (handle == NULL || !sm.ready) {
++		return -1;
++	}
++	for (slot = 0; slot < SM_SYNCOBJ_MAX; slot++) {
++		if (!sm.sync[slot].used) {
++			break;
++		}
++	}
++	if (slot == SM_SYNCOBJ_MAX) {
++		return -2;
++	}
++	sm.sync[slot].used = TRUE;
++	sm.sync[slot].signaled = FALSE;
++	*handle = slot + 1u;	/* 0 means "no fence", so handles start at 1 */
++	return 0;
++}
++
++int
++sm_syncobj_destroy(uint32_t handle)
++{
++	if (handle == 0 || handle > SM_SYNCOBJ_MAX ||
++	    !sm.sync[handle - 1u].used) {
++		return -1;
++	}
++	sm.sync[handle - 1u].used = FALSE;
++	sm.sync[handle - 1u].signaled = FALSE;
++	return 0;
++}
++
++int
++sm_syncobj_wait(uint32_t handle, int64_t timeout_ns, uint32_t *signaled)
++{
++	if (signaled == NULL || handle == 0 || handle > SM_SYNCOBJ_MAX ||
++	    !sm.sync[handle - 1u].used) {
++		return SM_WAIT_EBADARG;
++	}
++	return sm_wait_bool(&sm.sync[handle - 1u].signaled, TRUE, timeout_ns,
++	    signaled);
++}
++
++/* SUBMIT's completion: one bit, set for success, fault and timeout alike. */
++static void
++sm_syncobj_signal(uint32_t handle)
++{
++	if (handle >= 1u && handle <= SM_SYNCOBJ_MAX &&
++	    sm.sync[handle - 1u].used) {
++		sm.sync[handle - 1u].signaled = TRUE;
++	}
++}
++
++void
++sm_syncobj_close_all(void)
++{
++	uint32_t slot;
++
++	for (slot = 0; slot < SM_SYNCOBJ_MAX; slot++) {
++		sm.sync[slot].used = FALSE;
++		sm.sync[slot].signaled = FALSE;
++	}
++}
++
++int
++sm_bo_wait(uint32_t handle, int64_t timeout_ns, uint32_t *idle)
++{
++	if (idle == NULL || handle >= SM_BO_MAX || !sm.bo[handle].used) {
++		return SM_WAIT_EBADARG;
++	}
++	return sm_wait_bool(&sm.bo[handle].busy, FALSE, timeout_ns, idle);
++}
++
++int
++sm_bo_sync(uint32_t handle, uint32_t type, uint32_t offset, uint32_t size)
++{
++	struct sm_bo *bo;
++	uint64_t len;
++
++	if (handle >= SM_BO_MAX || !sm.bo[handle].used) {
++		return -1;
++	}
++	if (type != SM_BO_SYNC_CPU_CACHE_FLUSH &&
++	    type != SM_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE) {
++		return -1;
++	}
++	bo = &sm.bo[handle];
++	if (offset >= bo->size) {
++		return -1;
++	}
++	len = size == 0 ? bo->size - offset : size;
++	if (len > bo->size - offset) {
++		return -1;
++	}
++	if (type == SM_BO_SYNC_CPU_CACHE_FLUSH) {
++		sm_cache_clean(bo->kva + offset, (vm_size_t)len);
++	} else {
++		sm_cache_clean_invalidate(bo->kva + offset, (vm_size_t)len);
++	}
++	return 0;
+ }
+ 
+ /* The VA a case names for the batch's page-internal pointers. */
+@@ -2359,7 +2551,7 @@
+ }
+ 
+ /*
+- * D2: submit a job descriptor the *client* built.
++ * D2: submit a job descriptor the *client* built.  D3 adds the fences.
+  *
+  * The descriptor is neither copied nor touched.  `jc` is a GPU VA inside one
+  * of the listed BOs; the only thing this function does to those BOs is cache
+@@ -2371,24 +2563,51 @@
+  * The handle list is also the validation set: `jc` must lie in one of the
+  * listed BOs, so a client cannot submit a descriptor from memory it does not
+  * own.  The GPU would fault on it anyway, but a refused call is a better
+- * answer than a fault.  D2 does not parse the descriptor for further
+- * resources, so a pointer to an *unlisted* BO is the client's risk until D3
+- * pins resources the way panfrost's submit does.
+- */
++ * answer than a fault.  The descriptor itself is not parsed for further
++ * resources, so a pointer to an *unlisted* BO is the client's risk until the
++ * Mesa winsys pins resources the way panfrost's submit does.
++ *
++ * D3: `out_sync` is signalled when the job is done -- including a fault and a
++ * timeout, so a waiter can never hang on a job that will never finish.  The
++ * `in_syncs` are waited for before the doorbell; in D3 the job is synchronous,
++ * so a producer's fence is already signalled unless the producer is another
++ * thread, and the bounded wait (100 ms) turns a missing producer into
++ * SM_SUBMIT_ESYNC rather than an unbounded block.
++ *
++ * A fault or timeout resets the GPU through sm_case_reset() -- soft reset,
++ * G57 quirks, power units, AS0/AS1 reload -- the path the probe suite's
++ * rst-4k case proved.  The next submit must work, and the D3 test makes that
++ * a counted check rather than a hope.
++ */
++static int sm_case_reset(void);
++
+ int
+ sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
++    uint32_t out_sync, const uint32_t *in_syncs, uint32_t in_count,
+     uint32_t *rawstat)
+ {
+ 	struct sm_bo *jb = NULL;
+ 	uint32_t status;
++	uint32_t mmu;
+ 	uint32_t i;
+ 
+ 	if (!sm.ready || sm.gpu == 0) {
+ 		return SM_SUBMIT_ENOTREADY;
+ 	}
+ 	if (handles == NULL || count == 0 || count > SM_SUBMIT_MAX_BOS ||
+-	    (jc & 3ull) != 0) {
++	    (jc & 3ull) != 0 || in_count > SM_SUBMIT_MAX_SYNCS ||
++	    (in_count > 0 && in_syncs == NULL)) {
+ 		return SM_SUBMIT_EBADARG;
++	}
++	if (out_sync != 0 && (out_sync > SM_SYNCOBJ_MAX ||
++	    !sm.sync[out_sync - 1u].used)) {
++		return SM_SUBMIT_EBADARG;
++	}
++	for (i = 0; i < in_count; i++) {
++		if (in_syncs[i] == 0 || in_syncs[i] > SM_SYNCOBJ_MAX ||
++		    !sm.sync[in_syncs[i] - 1u].used) {
++			return SM_SUBMIT_EBADARG;
++		}
+ 	}
+ 	for (i = 0; i < count; i++) {
+ 		uint32_t h = handles[i];
+@@ -2415,8 +2634,17 @@
+ 	if (jc + 64ull > jb->gpu_va + jb->size) {
+ 		return SM_SUBMIT_EJC;
+ 	}
++	for (i = 0; i < in_count; i++) {
++		uint32_t signaled = 0;
++
++		if (sm_syncobj_wait(in_syncs[i], SM_IN_SYNC_TIMEOUT_NS,
++		    &signaled) != SM_WAIT_OK) {
++			return SM_SUBMIT_ESYNC;
++		}
++	}
+ 
+ 	for (i = 0; i < count; i++) {
++		sm.bo[handles[i]].busy = TRUE;
+ 		sm_cache_clean_invalidate(sm.bo[handles[i]].kva,
+ 		    sm.bo[handles[i]].size);
+ 	}
+@@ -2430,23 +2658,47 @@
+ 	 */
+ 	status = sm_job_submit(jc, SM_JS_CONFIG_BASE | SM_JS_CONFIG_START_MMU,
+ 	    sm.shader_present, 0);
++	/*
++	 * An MMU fault is latched in MMU_INT_RAWSTAT, not in the job slot's
++	 * completion/fault bits: the slot stalls at JS_STATUS 8 and the job
++	 * interrupt never fires.  Probe 12's va-4k-neigh/rst-4k cases show
++	 * exactly that pair, and this is the client-side consequence: read the
++	 * MMU register once, and treat it as a fault before the timeout path.
++	 */
++	mmu = sm_rd(sm.gpu + SM_MMU_INT_RAWSTAT);
+ 	for (i = 0; i < count; i++) {
+ 		sm_cache_clean_invalidate(sm.bo[handles[i]].kva,
+ 		    sm.bo[handles[i]].size);
++		sm.bo[handles[i]].busy = FALSE;
++	}
++	/* A finished job is a finished job, fault or not: never leave a waiter. */
++	if (out_sync != 0) {
++		sm_syncobj_signal(out_sync);
+ 	}
+ 	if (rawstat != NULL) {
+ 		*rawstat = status;
+ 	}
+-	if (status & (1u << 16)) {
++	if ((status & (1u << 16)) || mmu != 0) {
++		int rc;
++
+ 		printf("SWEETMALI: SUBMIT fault rawstat=%x js=%x mmu=%x "
+ 		    "addr=%x%x\n", status,
+-		    sm_rd(sm.gpu + SM_JS_STATUS(0)),
+-		    sm_rd(sm.gpu + SM_MMU_INT_RAWSTAT),
++		    sm_rd(sm.gpu + SM_JS_STATUS(0)), mmu,
+ 		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_HI(0)),
+ 		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_LO(0)));
++		rc = sm_case_reset();
++		sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
++		if (rc != 0) {
++			printf("SWEETMALI: SUBMIT recovery reset failed rc=%d\n",
++			    rc);
++		}
+ 		return SM_SUBMIT_EGPUFAULT;
+ 	}
+ 	if ((status & 1u) == 0) {
++		printf("SWEETMALI: SUBMIT timeout rawstat=%x js=%x mmu=%x\n",
++		    status, sm_rd(sm.gpu + SM_JS_STATUS(0)), mmu);
++		(void)sm_case_reset();
++		sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
+ 		return SM_SUBMIT_ETIMEOUT;
+ 	}
+ 	return SM_SUBMIT_OK;
+
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * SweetMali IOKit surface: the service and the user client, stages D1 and D2.
++ * SweetMali IOKit surface: the service and the user client, stages D1-D3.
+  *
+  * The GPU itself is bsd/dev/sweet_mali.c; this file is only the door.  It
+  * exists because the next stages need a client to own GPU memory and hand the
+@@ -152,6 +152,7 @@
+ 	 * MMAP_BO/B2, which is when two clients can hold BOs at once.
+ 	 */
+ 	sm_bo_close_all();
++	sm_syncobj_close_all();
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -369,10 +370,11 @@
+  *
+  * `jc` must lie inside one of the listed BOs; SM_SUBMIT_EJC is the answer
+  * when it does not, and the core's comment explains why that check exists
+- * even though the GPU's MMU would fault on a foreign address anyway.  D2 runs
+- * the job to completion inside the call -- the same polled wait the kernel
+- * probe suite uses -- because fences are D3; `out_sync` is therefore required
+- * to be zero on input and is zero on output.
++ * even though the GPU's MMU would fault on a foreign address anyway.  The job
++ * runs to completion inside the call -- the same polled wait the kernel probe
++ * suite uses -- and `out_sync`, if nonzero, is signalled before the call
++ * returns.  `in_syncs` are waited for first; a producer that has not signalled
++ * returns kIOReturnNotReady instead of blocking the client.
+  */
+ static IOReturn
+ sm_uc_submit(IOExternalMethodArguments *args)
+@@ -385,20 +387,128 @@
+ 		return kIOReturnBadArgument;
+ 	}
+ 	if (s.bo_count == 0 || s.bo_count > SM_SUBMIT_MAX_BOS ||
+-	    s.out_sync != 0) {
+-		return kIOReturnBadArgument;
+-	}
+-	rc = sm_client_submit(s.jc, s.bo_handles, s.bo_count, &rawstat);
++	    (s.out_sync >> 32) != 0 ||
++	    s.in_sync_count > SM_SUBMIT_MAX_SYNCS) {
++		return kIOReturnBadArgument;
++	}
++	rc = sm_client_submit(s.jc, s.bo_handles, s.bo_count,
++	    (uint32_t)s.out_sync, s.in_syncs, s.in_sync_count, &rawstat);
+ 	s.rawstat = rawstat;
+-	s.out_sync = 0;
++	if (rc == SM_SUBMIT_OK) {
++		return sm_uc_out(args, &s, sizeof(s));
++	}
++	/* The return value is the error; the struct still carries diagnosis. */
++	(void)sm_uc_out(args, &s, sizeof(s));
+ 	switch (rc) {
+-	case SM_SUBMIT_OK:
+-		return sm_uc_out(args, &s, sizeof(s));
+ 	case SM_SUBMIT_ENOTREADY:
++	case SM_SUBMIT_ESYNC:
+ 		return kIOReturnNotReady;
+ 	case SM_SUBMIT_EGPUFAULT:
+ 		return kIOReturnDMAError;
+ 	case SM_SUBMIT_ETIMEOUT:
++		return kIOReturnTimeout;
++	default:
++		return kIOReturnBadArgument;
++	}
++}
++
++/*
++ * WAIT_BO: panfrost's (handle, timeout_ns), with the answer in the struct.
++ * A timeout is an answer, not a malformed call: the client gets
++ * kIOReturnTimeout plus signaled=0, and can tell "not yet" from "no such BO".
++ */
++static IOReturn
++sm_uc_wait_bo(IOExternalMethodArguments *args)
++{
++	struct sm_wait_bo w;
++	int rc;
++
++	if (sm_uc_in(args, &w, sizeof(w)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	rc = sm_bo_wait(w.handle, w.timeout_ns, &w.signaled);
++	if (sm_uc_out(args, &w, sizeof(w)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	switch (rc) {
++	case SM_WAIT_OK:
++		return kIOReturnSuccess;
++	case SM_WAIT_ETIMEDOUT:
++		return kIOReturnTimeout;
++	default:
++		return kIOReturnBadArgument;
++	}
++}
++
++/*
++ * SYNC_BO: one cache op on a BO range; the core answers success or refuses
++ * a bad handle/type/range.
++ */
++static IOReturn
++sm_uc_sync_bo(IOExternalMethodArguments *args)
++{
++	struct sm_sync_bo s;
++
++	if (sm_uc_in(args, &s, sizeof(s)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	if (sm_bo_sync(s.handle, s.type, s.offset, s.size) != 0) {
++		return kIOReturnBadArgument;
++	}
++	return kIOReturnSuccess;
++}
++
++/* SYNCOBJ_CREATE: an unsignalled fence handle, like DRM_SYNCOBJ_CREATE. */
++static IOReturn
++sm_uc_syncobj_create(IOExternalMethodArguments *args)
++{
++	struct sm_syncobj_create c;
++
++	if (sm_uc_in(args, &c, sizeof(c)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	if (sm_syncobj_create(&c.handle) != 0) {
++		return kIOReturnNoResources;
++	}
++	c.pad = 0;
++	return sm_uc_out(args, &c, sizeof(c));
++}
++
++static IOReturn
++sm_uc_syncobj_destroy(IOExternalMethodArguments *args)
++{
++	struct sm_syncobj_destroy d;
++
++	if (sm_uc_in(args, &d, sizeof(d)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	if (sm_syncobj_destroy(d.handle) != 0) {
++		return kIOReturnBadArgument;
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * SYNCOBJ_WAIT: the same timeout contract as WAIT_BO.  On a timeout the
++ * struct still goes back (signaled=0), so the client never has to guess.
++ */
++static IOReturn
++sm_uc_syncobj_wait(IOExternalMethodArguments *args)
++{
++	struct sm_syncobj_wait w;
++	int rc;
++
++	if (sm_uc_in(args, &w, sizeof(w)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	rc = sm_syncobj_wait(w.handle, w.timeout_ns, &w.signaled);
++	if (sm_uc_out(args, &w, sizeof(w)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	switch (rc) {
++	case SM_WAIT_OK:
++		return kIOReturnSuccess;
++	case SM_WAIT_ETIMEDOUT:
+ 		return kIOReturnTimeout;
+ 	default:
+ 		return kIOReturnBadArgument;
+@@ -423,6 +533,16 @@
+ 		return sm_uc_close_bo(args);
+ 	case SM_SEL_SUBMIT:
+ 		return sm_uc_submit(args);
++	case SM_SEL_WAIT_BO:
++		return sm_uc_wait_bo(args);
++	case SM_SEL_SYNC_BO:
++		return sm_uc_sync_bo(args);
++	case SM_SEL_SYNCOBJ_CREATE:
++		return sm_uc_syncobj_create(args);
++	case SM_SEL_SYNCOBJ_DESTROY:
++		return sm_uc_syncobj_destroy(args);
++	case SM_SEL_SYNCOBJ_WAIT:
++		return sm_uc_syncobj_wait(args);
+ 	default:
+ 		/*
+ 		 * Log the first time an unknown selector is used, like the
+@@ -722,6 +842,436 @@
+ 	    nok, ntest, nbad ? ", see BAD lines above" : "");
+ }
+ 
++/*
++ * D3: fences, waits, cache sync, fault reset and recovery.
++ *
++ * The interesting group is the last one.  A job whose write target is a BO
++ * that has been created, read and closed cannot land anywhere: CLOSE_BO
++ * cleared the PTE, so the job takes an MMU fault.  The submit path must
++ * report it, reset the GPU, and the next job must still write -- that is the
++ * recovery path this stage exists for, and it is exercised on purpose rather
++ * than reasoned about.
++ */
++#define SM_D3_VALUE1 0x0123456789abcdefull
++#define SM_D3_VALUE2 0x0fedcba987654321ull
++#define SM_D3_VALUE3 0xa5a5a5a5a5a5a5a5ull
++
++static void
++sm_d3_job(volatile uint32_t *desc, uint64_t target, uint64_t value)
++{
++	uint32_t i;
++
++	for (i = 0; i < SM_BO_PAGE_SIZE / 4u; i++) {
++		desc[i] = 0;
++	}
++	desc[4] = ((SM_D2_JOB_WRITE_VALUE & 0x7fu) << 1) | (1u << 16);
++	desc[8] = (uint32_t)target;
++	desc[9] = (uint32_t)(target >> 32);
++	desc[10] = SM_D2_IMM64 & 0x7u;
++	desc[12] = (uint32_t)value;
++	desc[13] = (uint32_t)(value >> 32);
++}
++
++static void
++sweet_mali_uc_test_d3(IOUserClient *uc)
++{
++	struct sm_syncobj_create sc;
++	struct sm_syncobj_destroy sd;
++	struct sm_syncobj_wait sw;
++	struct sm_wait_bo wb;
++	struct sm_sync_bo sb;
++	struct sm_create_bo c;
++	struct sm_get_bo_offset g;
++	struct sm_close_bo cl;
++	struct sm_submit sub;
++	volatile uint32_t *desc = NULL;
++	volatile uint64_t *target = NULL;
++	uint32_t h0 = 0, h1 = 0, h2 = 0;
++	uint32_t s0 = 0, s1 = 0, s2 = 0;
++	uint64_t va0 = 0, va1 = 0, va2 = 0;
++	uint32_t nok = 0, ntest = 0, nbad = 0;
++	bool have0 = false, have1 = false, have2 = false;
++	IOReturn kr;
++	bool ok;
++
++	SM_LOG("---- stage D3 ----\n");
++
++	/* 1: an unsignalled fence */
++	memset(&sc, 0, sizeof(sc));
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_CREATE, &sc, sizeof(sc), &sc,
++	    sizeof(sc));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; s0 = sc.handle; } else nbad++;
++	SM_LOG("%s SYNCOBJ_CREATE A handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    sc.handle, kr);
++
++	/* 2: poll: an unsignalled fence must answer "not yet" at once */
++	memset(&sw, 0, sizeof(sw));
++	sw.handle = s0;
++	sw.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_WAIT, &sw, sizeof(sw), &sw,
++	    sizeof(sw));
++	ntest++;
++	ok = (kr == kIOReturnTimeout && sw.signaled == 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_WAIT A poll signaled=%u kr=%x\n",
++	    ok ? "ok " : "BAD", sw.signaled, kr);
++
++	/* 3: and the timer path, with a real 1 ms timeout */
++	memset(&sw, 0, sizeof(sw));
++	sw.handle = s0;
++	sw.timeout_ns = 1000000ll;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_WAIT, &sw, sizeof(sw), &sw,
++	    sizeof(sw));
++	ntest++;
++	ok = (kr == kIOReturnTimeout && sw.signaled == 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_WAIT A 1ms signaled=%u kr=%x\n",
++	    ok ? "ok " : "BAD", sw.signaled, kr);
++
++	/*
++	 * BO0 is the descriptor, BO1 the target, BO2 exists only to hand out a
++	 * VA that CLOSE_BO then unmaps: the fault test needs an address that
++	 * is inside the GPU's VA window and definitely has no PTE.
++	 */
++	memset(&c, 0, sizeof(c));
++	c.size = SM_BO_PAGE_SIZE;
++	kr = sm_uc_call(uc, SM_SEL_CREATE_BO, &c, sizeof(c), &c, sizeof(c));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; have0 = true; h0 = c.handle; } else nbad++;
++	SM_LOG("%s CREATE_BO 0 handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    c.handle, kr);
++
++	memset(&c, 0, sizeof(c));
++	c.size = SM_BO_PAGE_SIZE;
++	kr = sm_uc_call(uc, SM_SEL_CREATE_BO, &c, sizeof(c), &c, sizeof(c));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; have1 = true; h1 = c.handle; } else nbad++;
++	SM_LOG("%s CREATE_BO 1 handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    c.handle, kr);
++
++	memset(&c, 0, sizeof(c));
++	c.size = SM_BO_PAGE_SIZE;
++	kr = sm_uc_call(uc, SM_SEL_CREATE_BO, &c, sizeof(c), &c, sizeof(c));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; have2 = true; h2 = c.handle; } else nbad++;
++	SM_LOG("%s CREATE_BO 2 handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    c.handle, kr);
++
++	memset(&g, 0, sizeof(g));
++	g.handle = h0;
++	kr = sm_uc_call(uc, SM_SEL_GET_BO_OFFSET, &g, sizeof(g), &g, sizeof(g));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && g.offset != 0);
++	if (ok) { nok++; va0 = g.offset; } else nbad++;
++	SM_LOG("%s GET_BO_OFFSET 0 va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    (unsigned long long)g.offset, kr);
++
++	memset(&g, 0, sizeof(g));
++	g.handle = h1;
++	kr = sm_uc_call(uc, SM_SEL_GET_BO_OFFSET, &g, sizeof(g), &g, sizeof(g));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && g.offset != 0);
++	if (ok) { nok++; va1 = g.offset; } else nbad++;
++	SM_LOG("%s GET_BO_OFFSET 1 va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    (unsigned long long)g.offset, kr);
++
++	memset(&g, 0, sizeof(g));
++	g.handle = h2;
++	kr = sm_uc_call(uc, SM_SEL_GET_BO_OFFSET, &g, sizeof(g), &g, sizeof(g));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && g.offset != 0);
++	if (ok) { nok++; va2 = g.offset; } else nbad++;
++	SM_LOG("%s GET_BO_OFFSET 2 va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    (unsigned long long)g.offset, kr);
++
++	memset(&cl, 0, sizeof(cl));
++	cl.handle = h2;
++	kr = sm_uc_call(uc, SM_SEL_CLOSE_BO, &cl, sizeof(cl), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; have2 = false; } else nbad++;
++	SM_LOG("%s CLOSE_BO 2 (va %llx becomes a hole) kr=%x\n",
++	    ok ? "ok " : "BAD", (unsigned long long)va2, kr);
++
++	if (!have0 || !have1 || va0 == 0 || va1 == 0 || va2 == 0) {
++		goto out;
++	}
++
++	desc = (volatile uint32_t *)sm_bo_kva(h0);
++	target = (volatile uint64_t *)sm_bo_kva(h1);
++	ntest++;
++	ok = (desc != NULL && target != NULL);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s bo kva desc=%p target=%p\n", ok ? "ok " : "BAD",
++	    (void *)desc, (void *)target);
++	if (!ok) {
++		goto out;
++	}
++
++	/* 4: a good job, and fence A is signalled when SUBMIT returns */
++	sm_d3_job(desc, va1, SM_D3_VALUE1);
++	*target = SM_D2_SENTINEL;
++	memset(&sub, 0, sizeof(sub));
++	sub.jc = va0;
++	sub.bo_count = 2;
++	sub.bo_handles[0] = h0;
++	sub.bo_handles[1] = h1;
++	sub.out_sync = s0;
++	kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub, sizeof(sub));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && (sub.rawstat & 1u) != 0 &&
++	    (sub.rawstat & (1u << 16)) == 0 && *target == SM_D3_VALUE1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT job1 out=A rawstat=%x target=%llx kr=%x\n",
++	    ok ? "ok " : "BAD", sub.rawstat, (unsigned long long)*target, kr);
++
++	memset(&sw, 0, sizeof(sw));
++	sw.handle = s0;
++	sw.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_WAIT, &sw, sizeof(sw), &sw,
++	    sizeof(sw));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sw.signaled == 1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_WAIT A after job1 signaled=%u kr=%x\n",
++	    ok ? "ok " : "BAD", sw.signaled, kr);
++
++	/* 5: WAIT_BO on the BO the job wrote; a bad handle is not a timeout */
++	memset(&wb, 0, sizeof(wb));
++	wb.handle = h1;
++	wb.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_WAIT_BO, &wb, sizeof(wb), &wb, sizeof(wb));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && wb.signaled == 1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s WAIT_BO 1 signaled=%u kr=%x\n", ok ? "ok " : "BAD",
++	    wb.signaled, kr);
++
++	memset(&wb, 0, sizeof(wb));
++	wb.handle = 0xffffffffu;
++	wb.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_WAIT_BO, &wb, sizeof(wb), &wb, sizeof(wb));
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s WAIT_BO bad handle kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	/* 6: SYNC_BO both cache ops, then two refusals */
++	memset(&sb, 0, sizeof(sb));
++	sb.handle = h1;
++	sb.type = SM_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE;
++	sb.offset = 0;
++	sb.size = 0;
++	kr = sm_uc_call(uc, SM_SEL_SYNC_BO, &sb, sizeof(sb), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess && *target == SM_D3_VALUE1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNC_BO 1 flush+inv target=%llx kr=%x\n",
++	    ok ? "ok " : "BAD", (unsigned long long)*target, kr);
++
++	memset(&sb, 0, sizeof(sb));
++	sb.handle = h1;
++	sb.type = SM_BO_SYNC_CPU_CACHE_FLUSH;
++	sb.offset = 0;
++	sb.size = (uint32_t)SM_BO_PAGE_SIZE;
++	kr = sm_uc_call(uc, SM_SEL_SYNC_BO, &sb, sizeof(sb), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNC_BO 1 flush kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&sb, 0, sizeof(sb));
++	sb.handle = 0xffffffffu;
++	sb.type = SM_BO_SYNC_CPU_CACHE_FLUSH;
++	kr = sm_uc_call(uc, SM_SEL_SYNC_BO, &sb, sizeof(sb), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNC_BO bad handle kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&sb, 0, sizeof(sb));
++	sb.handle = h1;
++	sb.type = 7;
++	kr = sm_uc_call(uc, SM_SEL_SYNC_BO, &sb, sizeof(sb), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNC_BO bad type kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	/* 7: fence B, and the A -> B chain a Mesa batch would build */
++	memset(&sc, 0, sizeof(sc));
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_CREATE, &sc, sizeof(sc), &sc,
++	    sizeof(sc));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; s1 = sc.handle; } else nbad++;
++	SM_LOG("%s SYNCOBJ_CREATE B handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    sc.handle, kr);
++
++	sm_d3_job(desc, va1, SM_D3_VALUE2);
++	*target = SM_D2_SENTINEL;
++	memset(&sub, 0, sizeof(sub));
++	sub.jc = va0;
++	sub.bo_count = 2;
++	sub.bo_handles[0] = h0;
++	sub.bo_handles[1] = h1;
++	sub.out_sync = s1;
++	sub.in_sync_count = 1;
++	sub.in_syncs[0] = s0;
++	kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub, sizeof(sub));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && *target == SM_D3_VALUE2);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT job2 in=A out=B rawstat=%x target=%llx kr=%x\n",
++	    ok ? "ok " : "BAD", sub.rawstat, (unsigned long long)*target, kr);
++
++	memset(&sw, 0, sizeof(sw));
++	sw.handle = s1;
++	sw.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_WAIT, &sw, sizeof(sw), &sw,
++	    sizeof(sw));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sw.signaled == 1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_WAIT B after job2 signaled=%u kr=%x\n",
++	    ok ? "ok " : "BAD", sw.signaled, kr);
++
++	/* 8: an unsignalled in-fence is refused, and the job does not run */
++	memset(&sc, 0, sizeof(sc));
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_CREATE, &sc, sizeof(sc), &sc,
++	    sizeof(sc));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; s2 = sc.handle; } else nbad++;
++	SM_LOG("%s SYNCOBJ_CREATE C handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    sc.handle, kr);
++
++	sm_d3_job(desc, va1, SM_D3_VALUE2);
++	*target = SM_D2_SENTINEL;
++	memset(&sub, 0, sizeof(sub));
++	sub.jc = va0;
++	sub.bo_count = 2;
++	sub.bo_handles[0] = h0;
++	sub.bo_handles[1] = h1;
++	sub.in_sync_count = 1;
++	sub.in_syncs[0] = s2;
++	kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub, sizeof(sub));
++	ntest++;
++	ok = (kr == kIOReturnNotReady && *target == SM_D2_SENTINEL);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT in=C (unsignalled) refused target=%llx kr=%x\n",
++	    ok ? "ok " : "BAD", (unsigned long long)*target, kr);
++
++	/*
++	 * 9: the delivery.  A write to the VA CLOSE_BO unmapped must fault,
++	 * the driver must reset, and the fence must still signal -- otherwise
++	 * a client waiting on it would hang after a GPU fault.
++	 */
++	sm_d3_job(desc, va2, SM_D3_VALUE3);
++	memset(&sub, 0, sizeof(sub));
++	sub.jc = va0;
++	sub.bo_count = 1;
++	sub.bo_handles[0] = h0;
++	sub.out_sync = s1;
++	kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub, sizeof(sub));
++	ntest++;
++	ok = (kr == kIOReturnDMAError);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT fault target=hole va=%llx rawstat=%x kr=%x\n",
++	    ok ? "ok " : "BAD", (unsigned long long)va2, sub.rawstat, kr);
++
++	memset(&sw, 0, sizeof(sw));
++	sw.handle = s1;
++	sw.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_WAIT, &sw, sizeof(sw), &sw,
++	    sizeof(sw));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sw.signaled == 1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_WAIT B after fault signaled=%u kr=%x\n",
++	    ok ? "ok " : "BAD", sw.signaled, kr);
++
++	/* 10: recovery: the same BOs, a good target, a new value */
++	sm_d3_job(desc, va1, SM_D3_VALUE3);
++	*target = SM_D2_SENTINEL;
++	memset(&sub, 0, sizeof(sub));
++	sub.jc = va0;
++	sub.bo_count = 2;
++	sub.bo_handles[0] = h0;
++	sub.bo_handles[1] = h1;
++	sub.out_sync = s1;
++	kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub, sizeof(sub));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && (sub.rawstat & 1u) != 0 &&
++	    *target == SM_D3_VALUE3);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT recovery rawstat=%x target=%llx want=%llx kr=%x\n",
++	    ok ? "ok " : "BAD", sub.rawstat, (unsigned long long)*target,
++	    (unsigned long long)SM_D3_VALUE3, kr);
++
++	/* 11: teardown: destroy is final, and a destroyed handle is refused */
++	memset(&sd, 0, sizeof(sd));
++	sd.handle = s0;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_DESTROY, &sd, sizeof(sd), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_DESTROY A kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&sw, 0, sizeof(sw));
++	sw.handle = s0;
++	sw.timeout_ns = 0;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_WAIT, &sw, sizeof(sw), &sw,
++	    sizeof(sw));
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_WAIT A after destroy kr=%x\n",
++	    ok ? "ok " : "BAD", kr);
++
++	memset(&sd, 0, sizeof(sd));
++	sd.handle = s1;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_DESTROY, &sd, sizeof(sd), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_DESTROY B kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&sd, 0, sizeof(sd));
++	sd.handle = s1;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_DESTROY, &sd, sizeof(sd), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_DESTROY B again kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&sd, 0, sizeof(sd));
++	sd.handle = s2;
++	kr = sm_uc_call(uc, SM_SEL_SYNCOBJ_DESTROY, &sd, sizeof(sd), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SYNCOBJ_DESTROY C kr=%x\n", ok ? "ok " : "BAD", kr);
++
++out:
++	if (have0) {
++		sm_bo_destroy(h0);
++	}
++	if (have1) {
++		sm_bo_destroy(h1);
++	}
++	if (have2) {
++		sm_bo_destroy(h2);
++	}
++	SM_LOG("%s (%u/%u%s)\n", (nok == ntest && nbad == 0) ? "PASS" : "FAIL",
++	    nok, ntest, nbad ? ", see BAD lines above" : "");
++}
++
+ extern "C" void
+ sweet_mali_uc_test(void)
+ {
+@@ -864,6 +1414,13 @@
+ 	sweet_mali_uc_test_d2(uc);
+ 
+ 	/*
++	 * D3 uses the same connection after D2 has closed its BOs; it creates
++	 * its own BOs and fences, and the final fault/reset test leaves the
++	 * GPU recovered for the rest of the boot.
++	 */
++	sweet_mali_uc_test_d3(uc);
++
++	/*
+ 	 * The teardown a real close uses, in order: close the connection (our
+ 	 * clientClose() terminates the client), then drop the reference
+ 	 * newUserClient() returned retained.
+
