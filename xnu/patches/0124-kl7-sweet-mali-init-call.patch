@@ -1,0 +1,26 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern void kl7_input_init(void);
+ extern void kl7_fts_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_mali_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_VER         0x08
+@@ -1422,6 +1423,15 @@
+ 	}
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	/*
++	 * GPU: the Mali-G57 bring-up, in its own kernel thread (bsd/dev/
++	 * sweet_mali.c).  Nothing else calls it, so without this the GPU
++	 * stays down on a normal boot: the SweetMali service registers
++	 * "gpu not up", VERSION.ready never flips, and a userspace client
++	 * gets kIOReturnNotReady for CREATE_BO.  Start it with the other
++	 * device drivers, right after the console log and the sampler.
++	 */
++	sweet_mali_init();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	if (su.mtk) {
+ 		kl7_input_init();
