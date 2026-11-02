@@ -1,0 +1,59 @@
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -59,6 +59,22 @@
+  */
+ #define SWEET_AKS_LOCK_STATE    0x4
+ 
++/*
++ * Log volume.  One line per call is what found the selectors the system
++ * needs, but a client that polls one selector in a loop -- Spotlight alone
++ * made ~58k calls of selector 17 (kAKSGetDeviceState) in one boot -- then
++ * costs a proc_selfname() (a walk of the process list) and an IOLog() per
++ * call and fills the 4 MiB console ring within minutes, pushing out the boot
++ * lines the ring exists for.  Log the first few calls of each selector in
++ * full, then every SWEET_AKS_LOG_EVERYth, with the running count, so that a
++ * flood still shows up as a flood.  Selectors past the array are rare enough
++ * to always log.
++ */
++#define SWEET_AKS_LOG_FIRST     8u
++#define SWEET_AKS_LOG_EVERY     4096u
++#define SWEET_AKS_SELECTORS     128u
++static uint32_t sweet_aks_seen[SWEET_AKS_SELECTORS];
++
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+ 
+@@ -232,10 +248,29 @@
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/*
++	 * The counter is bumped without a lock: two callers racing can only
++	 * reorder or skip a log line, and the count is a diagnostic, not state.
++	 */
++	if (selector >= SWEET_AKS_SELECTORS) {
++		char name[32];
++
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n",
++		    name, selector, arg0, in_scalars, in_struct, out_scalars,
++		    out_struct, ret);
++	} else {
++		uint32_t seen = ++sweet_aks_seen[selector];
++
++		if (seen <= SWEET_AKS_LOG_FIRST || (seen % SWEET_AKS_LOG_EVERY) == 0) {
++			char name[32];
++
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x (call %u)\n",
++			    name, selector, arg0, in_scalars, in_struct, out_scalars,
++			    out_struct, ret, seen);
++		}
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
