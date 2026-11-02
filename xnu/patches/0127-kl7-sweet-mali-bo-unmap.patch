@@ -1,0 +1,199 @@
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -182,6 +182,13 @@
+ #define SM_SUBMIT_MAX_BOS       8u
+ #define SM_SUBMIT_MAX_SYNCS     8u
+ #define SM_SYNCOBJ_MAX          16u
++/*
++ * The handle table's size, and so the largest BO handle a client can hold.
++ * It is ABI because a handle is also the memory type a client passes to
++ * IOConnectMapMemory64(): the user client indexes its per-handle descriptor
++ * cache with it, and a handle at or above it must never reach that cache.
++ */
++#define SM_BO_MAX               32u
+ 
+ /*
+  * timeout_ns is relative: 0 polls, >0 waits that many nanoseconds, <0 means
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -358,9 +358,10 @@
+ /*
+  * D2: a client owns handles, not slots, so the table is sized for a working
+  * userspace (several BOs per frame) rather than for the three the probe
+- * suite needs.  32 entries is 32 * sizeof(struct sm_bo) of static data.
++ * suite needs.  32 entries is 32 * sizeof(struct sm_bo) of static data.  The
++ * constant itself lives in the ABI header: a handle is the memory type
++ * clientMemoryForType() sees, so the IOKit half needs the same number.
+  */
+-#define SM_BO_MAX 32u
+ 
+ /* Which pointers of a batch use the custom VA instead of the PA. */
+ #define SM_VA_CODE    0x01u	/* shader code (vspd/fspd word 2..3) */
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -161,6 +161,17 @@
+ 
+ 	SweetMali *fProvider;
+ 
++	/*
++	 * The physical descriptor handed to IOKit for each BO, by handle.  One
++	 * descriptor per BO, made once and handed out again on every
++	 * clientMemoryForType() call: IOConnectUnmapMemory64() asks for memory
++	 * type `type` a second time and then looks for the live mapping inside
++	 * the descriptor it gets back.  A fresh withPhysicalAddress() per call
++	 * -- what this did before -- leaves that descriptor's mapping list
++	 * empty, so the unmap finds nothing and fails with kIOReturnBadArgument.
++	 */
++	IOMemoryDescriptor *fBoMem[SM_BO_MAX];
++
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID,
+ 	    uint32_t type) APPLE_KEXT_OVERRIDE;
+@@ -171,6 +182,9 @@
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
++
++	/* Called before the core frees a BO's pages; see its definition. */
++	void unmapAndForgetBo(uint32_t handle);
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetMaliUserClient, IOUserClient);
+@@ -183,9 +197,47 @@
+ 		return false;
+ 	}
+ 	fProvider = NULL;
++	memset(fBoMem, 0, sizeof(fBoMem));
+ 	return true;
+ }
+ 
++/*
++ * Take this client's mapping of a BO away, if IOKit made one, and drop the
++ * descriptor it was handed for it.  Called from CLOSE_BO and from
++ * clientClose(), always before the core frees the BO's pages: a page that is
++ * still a User CPU mapping cannot be freed (pmap_assert_free: ... is a User
++ * CPU mapping).
++ *
++ * removeMappingForDescriptor() returns the IOMemoryMap IOUserClient created
++ * from that descriptor, and stops tracking it -- the only handle a driver has
++ * on a client's mapping.  unmap() then destroys the mapping itself; releasing
++ * the map alone is not enough, because the descriptor's own mapping list and
++ * the client's Mach port also hold references to it.
++ */
++void
++SweetMaliUserClient::unmapAndForgetBo(uint32_t handle)
++{
++	IOMemoryDescriptor *md;
++	IOMemoryMap *map;
++
++	if (handle >= SM_BO_MAX) {
++		return;
++	}
++	md = fBoMem[handle];
++	if (md == NULL) {
++		return;
++	}
++	fBoMem[handle] = NULL;
++
++	map = removeMappingForDescriptor(md);
++	if (map != NULL) {
++		map->unmap();
++		map->release();
++	}
++	/* Our cache's reference; the map's own reference, if any, lives on. */
++	md->release();
++}
++
+ bool
+ SweetMaliUserClient::start(IOService *provider)
+ {
+@@ -203,6 +255,8 @@
+ IOReturn
+ SweetMaliUserClient::clientClose(void)
+ {
++	uint32_t handle;
++
+ 	/*
+ 	 * Release the client's GPU memory before the task disappears: a BO's
+ 	 * memory is the client's, and the GPU may still be pointed at it.
+@@ -214,6 +268,15 @@
+ 	 * core's.
+ 	 */
+ 	sm_client_lock_take();
++	/*
++	 * Mappings first: sm_bo_close_all() frees the BO pages, and a page that
++	 * a User CPU mapping still points at cannot be freed.  A client that
++	 * goes away without unmapping -- this close, or a crash -- is the case
++	 * that used to trip pmap_assert_free.
++	 */
++	for (handle = 0; handle < SM_BO_MAX; handle++) {
++		unmapAndForgetBo(handle);
++	}
+ 	sm_bo_close_all(this);
+ 	sm_syncobj_close_all(this);
+ 	sm_client_lock_drop();
+@@ -242,21 +305,44 @@
+ 	*memory = NULL;
+ 	/*
+ 	 * The ownership check reads a BO table that another client's close may
+-	 * be walking; hold the door's lock across it.  The descriptor itself is
+-	 * built after the lock is dropped -- it needs the PA and the size, not
+-	 * the table -- so no allocation happens under the lock.
++	 * be walking, and the descriptor cache below is shared with that close;
++	 * hold the door's lock across both.
+ 	 */
+ 	sm_client_lock_take();
+ 	if (sm_bo_info(type, this, &pa, &size) != 0) {
+ 		sm_client_lock_drop();
+ 		return kIOReturnBadArgument;
+ 	}
+-	sm_client_lock_drop();
+-	md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,
+-	    (IOByteCount)size, kIODirectionInOut);
++	/*
++	 * sm_bo_info() has already refused a handle at or above SM_BO_MAX, so
++	 * `type` is a safe index into the cache.  The same descriptor has to
++	 * come back for a given BO on every call; see unmapAndForgetBo().
++	 */
++	md = fBoMem[type];
+ 	if (md == NULL) {
+-		return kIOReturnNoMemory;
++		md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,
++		    (IOByteCount)size, kIODirectionInOut);
++		if (md == NULL) {
++			sm_client_lock_drop();
++			return kIOReturnNoMemory;
++		}
++		fBoMem[type] = md;
+ 	}
++	/*
++	 * Hand the caller a reference of its own: IOKit releases the descriptor
++	 * after mapping or unmapping from it, and the mapping retains it while
++	 * it lives.  The cache above is what keeps the object -- and the mapping
++	 * list the unmap searches -- alive between those calls.
++	 */
++	md->retain();
++	sm_client_lock_drop();
++
++	/*
++	 * The BO is ordinary cacheable memory; SYNC_BO is what makes CPU writes
++	 * visible to the non-coherent GPU.  The value must not vary between the
++	 * map and the unmap, or the unmap's kIOMapReference lookup will not
++	 * match the mapping that exists.
++	 */
+ 	if (options != NULL) {
+ 		*options = kIOMapDefaultCache;
+ 	}
+@@ -457,6 +543,12 @@
+ 	if (sm_uc_in(args, &c, sizeof(c)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * The client's mapping of this BO, if it made one, has to go before the
++	 * core frees the pages behind it.  A handle this client does not own has
++	 * no cache entry here, so sm_bo_destroy() below still decides the answer.
++	 */
++	client->unmapAndForgetBo(c.handle);
+ 	if (sm_bo_destroy(c.handle, client) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
