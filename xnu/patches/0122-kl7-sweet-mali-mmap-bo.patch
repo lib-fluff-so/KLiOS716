@@ -1,0 +1,709 @@
+diff --git a/bsd/dev/sweet_mali.c b/bsd/dev/sweet_mali.c
+index 2f03aac..8d0b0e4 100644
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -458,12 +458,20 @@ struct sm_bo {
+ 	boolean_t used;
+ 	/* D3: set while a SUBMIT naming this BO is inside the core. */
+ 	boolean_t busy;
++	/*
++	 * F1/B2: the SweetMaliUserClient that created this BO, or NULL for the
++	 * kernel probe suite.  clientClose() only closes matching BOs, so the
++	 * first real userspace client cannot lose its memory when the probe
++	 * client goes away.
++	 */
++	void *owner;
+ };
+ 
+ /* D3: one fence.  The handle is the table index; the only state is the flag. */
+ struct sm_syncobj {
+ 	boolean_t used;
+ 	boolean_t signaled;
++	void *owner;
+ };
+ 
+ static struct sweet_mali {
+@@ -1722,6 +1730,7 @@ sm_bo_open(uint32_t slot, uint64_t size)
+ 	sm.bo[slot].gpu_va = va;
+ 	sm.bo[slot].used = TRUE;
+ 	sm.bo[slot].busy = FALSE;
++	sm.bo[slot].owner = NULL;
+ 	return 0;
+ }
+ 
+@@ -1757,6 +1766,7 @@ sm_bo_close(uint32_t slot)
+ 	bo->pa = 0;
+ 	bo->used = FALSE;
+ 	bo->busy = FALSE;
++	bo->owner = NULL;
+ }
+ 
+ /* The BO's first page becomes a byte-exact copy of the descriptor page, so a
+@@ -1794,7 +1804,7 @@ sm_bo_fill(uint32_t slot)
+  * descriptor "client-built" for a process rather than for the kernel thread.
+  */
+ int
+-sm_bo_create(uint64_t size, uint32_t *handle)
++sm_bo_create(uint64_t size, void *owner, uint32_t *handle)
+ {
+ 	uint32_t slot;
+ 
+@@ -1814,14 +1824,16 @@ sm_bo_create(uint64_t size, uint32_t *handle)
+ 	if (sm_bo_open(slot, size) != 0) {
+ 		return -3;
+ 	}
++	sm.bo[slot].owner = owner;
+ 	*handle = slot;
+ 	return 0;
+ }
+ 
+ int
+-sm_bo_destroy(uint32_t handle)
++sm_bo_destroy(uint32_t handle, void *owner)
+ {
+-	if (handle >= SM_BO_MAX || !sm.bo[handle].used) {
++	if (handle >= SM_BO_MAX || !sm.bo[handle].used ||
++	    sm.bo[handle].owner != owner) {
+ 		return -1;
+ 	}
+ 	sm_bo_close(handle);
+@@ -1835,19 +1847,18 @@ sm_bo_present(uint32_t handle)
+ }
+ 
+ /*
+- * The user client calls this from clientClose().  D2 still has one global
+- * handle table, so "all" means every BO in it; with the single client the
+- * probe suite has, that is exactly the client's set.  A per-client table is
+- * part of the same work as MMAP_BO, because that is when two clients can
+- * hold BOs at the same time.
++ * The user client calls this from clientClose().  F1/B2 made two clients
++ * possible, so "all" means every BO with this owner and nothing else: the
++ * kernel probe suite's BOs (owner NULL) survive a userspace client exiting,
++ * and one userspace client cannot free another's memory by closing.
+  */
+ void
+-sm_bo_close_all(void)
++sm_bo_close_all(void *owner)
+ {
+ 	uint32_t slot;
+ 
+ 	for (slot = 0; slot < SM_BO_MAX; slot++) {
+-		if (sm.bo[slot].used) {
++		if (sm.bo[slot].used && sm.bo[slot].owner == owner) {
+ 			sm_bo_close(slot);
+ 		}
+ 	}
+@@ -1871,6 +1882,23 @@ sm_bo_va(uint32_t handle)
+ 	return sm.bo[handle].gpu_va;
+ }
+ 
++/*
++ * F1/B2: the physical range behind a BO, for clientMemoryForType().  The
++ * owner check is what makes the mapping a client's own: a handle guessed by
++ * another connection is refused before any physical address escapes.
++ */
++int
++sm_bo_info(uint32_t handle, void *owner, uint64_t *pa, uint64_t *size)
++{
++	if (handle >= SM_BO_MAX || !sm.bo[handle].used ||
++	    sm.bo[handle].owner != owner || pa == NULL || size == NULL) {
++		return -1;
++	}
++	*pa = sm.bo[handle].pa;
++	*size = sm.bo[handle].size;
++	return 0;
++}
++
+ /*
+  * ---------------------------------------------------------------------------
+  * D3: fences, waits and cache sync
+@@ -1922,7 +1950,7 @@ sm_wait_bool(volatile boolean_t *flag, boolean_t want, int64_t timeout_ns,
+ }
+ 
+ int
+-sm_syncobj_create(uint32_t *handle)
++sm_syncobj_create(void *owner, uint32_t *handle)
+ {
+ 	uint32_t slot;
+ 
+@@ -1939,27 +1967,30 @@ sm_syncobj_create(uint32_t *handle)
+ 	}
+ 	sm.sync[slot].used = TRUE;
+ 	sm.sync[slot].signaled = FALSE;
++	sm.sync[slot].owner = owner;
+ 	*handle = slot + 1u;	/* 0 means "no fence", so handles start at 1 */
+ 	return 0;
+ }
+ 
+ int
+-sm_syncobj_destroy(uint32_t handle)
++sm_syncobj_destroy(uint32_t handle, void *owner)
+ {
+ 	if (handle == 0 || handle > SM_SYNCOBJ_MAX ||
+-	    !sm.sync[handle - 1u].used) {
++	    !sm.sync[handle - 1u].used || sm.sync[handle - 1u].owner != owner) {
+ 		return -1;
+ 	}
+ 	sm.sync[handle - 1u].used = FALSE;
+ 	sm.sync[handle - 1u].signaled = FALSE;
++	sm.sync[handle - 1u].owner = NULL;
+ 	return 0;
+ }
+ 
+ int
+-sm_syncobj_wait(uint32_t handle, int64_t timeout_ns, uint32_t *signaled)
++sm_syncobj_wait(uint32_t handle, void *owner, int64_t timeout_ns,
++    uint32_t *signaled)
+ {
+ 	if (signaled == NULL || handle == 0 || handle > SM_SYNCOBJ_MAX ||
+-	    !sm.sync[handle - 1u].used) {
++	    !sm.sync[handle - 1u].used || sm.sync[handle - 1u].owner != owner) {
+ 		return SM_WAIT_EBADARG;
+ 	}
+ 	return sm_wait_bool(&sm.sync[handle - 1u].signaled, TRUE, timeout_ns,
+@@ -1977,13 +2008,16 @@ sm_syncobj_signal(uint32_t handle)
+ }
+ 
+ void
+-sm_syncobj_close_all(void)
++sm_syncobj_close_all(void *owner)
+ {
+ 	uint32_t slot;
+ 
+ 	for (slot = 0; slot < SM_SYNCOBJ_MAX; slot++) {
+-		sm.sync[slot].used = FALSE;
+-		sm.sync[slot].signaled = FALSE;
++		if (sm.sync[slot].used && sm.sync[slot].owner == owner) {
++			sm.sync[slot].used = FALSE;
++			sm.sync[slot].signaled = FALSE;
++			sm.sync[slot].owner = NULL;
++		}
+ 	}
+ }
+ 
+@@ -2584,7 +2618,7 @@ static int sm_case_reset(void);
+ int
+ sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+     uint32_t out_sync, const uint32_t *in_syncs, uint32_t in_count,
+-    uint32_t *rawstat)
++    void *owner, uint32_t *rawstat)
+ {
+ 	struct sm_bo *jb = NULL;
+ 	uint32_t status;
+@@ -2637,7 +2671,7 @@ sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+ 	for (i = 0; i < in_count; i++) {
+ 		uint32_t signaled = 0;
+ 
+-		if (sm_syncobj_wait(in_syncs[i], SM_IN_SYNC_TIMEOUT_NS,
++		if (sm_syncobj_wait(in_syncs[i], owner, SM_IN_SYNC_TIMEOUT_NS,
+ 		    &signaled) != SM_WAIT_OK) {
+ 			return SM_SUBMIT_ESYNC;
+ 		}
+diff --git a/bsd/sys/sweet_mali.h b/bsd/sys/sweet_mali.h
+index a9972f3..806b72b 100644
+--- a/bsd/sys/sweet_mali.h
++++ b/bsd/sys/sweet_mali.h
+@@ -69,15 +69,23 @@ int sm_gpu_ready(void);
+  * handle is free, so a SUBMIT that still names the old address is refused
+  * rather than reaching whatever memory the allocator hands out next.
+  */
+-int sm_bo_create(uint64_t size, uint32_t *handle);
+-int sm_bo_destroy(uint32_t handle);
++/*
++ * F1/B2: `owner` is the SweetMaliUserClient instance (or NULL for the kernel
++ * probe suite).  A BO is created by one owner, destroyed by that owner, and
++ * clientClose() closes only that owner's BOs.  Without this, a second client
++ * (the first userspace one) would lose its BOs when the kernel probe suite's
++ * client closed -- which is exactly the first thing B2 makes possible.
++ */
++int sm_bo_create(uint64_t size, void *owner, uint32_t *handle);
++int sm_bo_destroy(uint32_t handle, void *owner);
+ int sm_bo_present(uint32_t handle);
+-void sm_bo_close_all(void);
++int sm_bo_info(uint32_t handle, void *owner, uint64_t *pa, uint64_t *size);
++void sm_bo_close_all(void *owner);
+ 
+ /*
+- * Kernel mapping of a BO.  This is the self-test's way to fill and read a BO
+- * before MMAP_BO exists; a real client gets its own mapping in B2/F1 through
+- * IOConnectMapMemory64 and never sees this call.
++ * Kernel mapping of a BO.  This is the self-test's way to fill and read a BO;
++ * a real client gets its own mapping in B2/F1 through IOConnectMapMemory64
++ * and never sees this call.
+  */
+ void *sm_bo_kva(uint32_t handle);
+ uint64_t sm_bo_va(uint32_t handle);
+@@ -93,7 +101,7 @@ uint64_t sm_bo_va(uint32_t handle);
+ 
+ int sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+     uint32_t out_sync, const uint32_t *in_syncs, uint32_t in_count,
+-    uint32_t *rawstat);
++    void *owner, uint32_t *rawstat);
+ 
+ /* ---- stage D3: fences, waits and cache sync ----------------------- */
+ 
+@@ -111,10 +119,11 @@ int sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+  * nothing else signals one in D3.  `sm_syncobj_close_all` is the client
+  * teardown, next to sm_bo_close_all.
+  */
+-int sm_syncobj_create(uint32_t *handle);
+-int sm_syncobj_destroy(uint32_t handle);
+-int sm_syncobj_wait(uint32_t handle, int64_t timeout_ns, uint32_t *signaled);
+-void sm_syncobj_close_all(void);
++int sm_syncobj_create(void *owner, uint32_t *handle);
++int sm_syncobj_destroy(uint32_t handle, void *owner);
++int sm_syncobj_wait(uint32_t handle, void *owner, int64_t timeout_ns,
++    uint32_t *signaled);
++void sm_syncobj_close_all(void *owner);
+ 
+ /*
+  * WAIT_BO: wait until the last SUBMIT naming this BO has finished.  D3 runs
+diff --git a/bsd/sys/sweet_mali_abi.h b/bsd/sys/sweet_mali_abi.h
+index 8e6404b..698d2c9 100644
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -35,6 +35,8 @@
+  * Bumped when a struct below changes meaning; GET_PARAM VERSION returns it.
+  * 2: D3 extends struct sm_submit (out_sync is an input fence handle now,
+  *    in_syncs[] was added) and adds the fence/wait/sync structs.
++ * F1/B2 only adds selectors and new structs; no existing layout changes, so
++ * the version stays 2 and a D3 client keeps working unchanged.
+  */
+ #define SM_ABI_VERSION          2u
+ 
+@@ -55,6 +57,9 @@
+ #define SM_SEL_SYNCOBJ_CREATE   0x08u   /* in/out: struct sm_syncobj_create */
+ #define SM_SEL_SYNCOBJ_DESTROY  0x09u   /* in: struct sm_syncobj_destroy */
+ #define SM_SEL_SYNCOBJ_WAIT     0x0au   /* in/out: struct sm_syncobj_wait */
++/* Added by stage F1/B2: client mapping and a kernel-log readback channel. */
++#define SM_SEL_MMAP_BO          0x0bu   /* in/out: struct sm_mmap_bo */
++#define SM_SEL_LOG              0x0cu   /* in/out: struct sm_log */
+ 
+ /* The service's class name in the IORegistry, and its user client class. */
+ #define SM_SERVICE_NAME         "SweetMali"
+@@ -129,10 +134,11 @@ struct sm_get_param {
+ /*
+  * D2: memory and submission; D3: fences, waits and cache sync.
+  *
+- * These are the panfrost UAPI calls a first userspace needs, minus MMAP_BO:
++ * These are the panfrost UAPI calls a first userspace needs:
+  *
+  *   SM_SEL_CREATE_BO      <- DRM_IOCTL_PANFROST_CREATE_BO
+  *   SM_SEL_GET_BO_OFFSET  <- DRM_IOCTL_PANFROST_GET_BO_OFFSET
++ *   SM_SEL_MMAP_BO        <- DRM_IOCTL_PANFROST_MMAP_BO      (F1/B2)
+  *   SM_SEL_SUBMIT         <- DRM_IOCTL_PANFROST_SUBMIT
+  *   SM_SEL_WAIT_BO        <- DRM_IOCTL_PANFROST_WAIT_BO
+  *   SM_SEL_SYNC_BO        <- DRM_IOCTL_PANFROST_SYNC_BO
+@@ -142,8 +148,9 @@ struct sm_get_param {
+  * the BO's GPU virtual address -- the number a job descriptor has to name --
+  * exactly as upstream does, so the userspace half keeps one number per BO and
+  * no VA arithmetic of its own.  `offset` in sm_create_bo is the *CPU* mapping
+- * offset, not the GPU one; D2 reserves it because MMAP_BO is stage B2 and
+- * needs a real client task, so a client that does not map simply ignores it.
++ * offset, not the GPU one; it equals the handle, and F1/B2's MMAP_BO returns
++ * the same number after validating the handle.  The actual pages come from
++ * IOConnectMapMemory64(), whose memory type is that offset.
+  *
+  * SUBMIT carries the BO and sync handles inline instead of through pointers
+  * like drm_panfrost_submit, because our transport is a copied struct and not
+@@ -271,4 +278,33 @@ struct sm_submit {
+ 	uint32_t in_syncs[SM_SUBMIT_MAX_SYNCS]; /* in: syncobjs to wait for */
+ };
+ 
++/*
++ * F1/B2: MMAP_BO is the last panfrost ioctl the kernel half was missing.
++ * Upstream returns a byte offset for mmap(2); here the offset *is* the BO
++ * handle, because IOConnectMapMemory64() takes the memory type (the handle)
++ * and the user client's clientMemoryForType() turns it into a physical
++ * descriptor.  A client never does arithmetic on the number; it passes it
++ * straight to mmap (libdrm stand-in) or to IOConnectMapMemory64.
++ */
++struct sm_mmap_bo {
++	uint32_t handle;        /* in */
++	uint32_t pad;
++	uint64_t offset;        /* out: CPU mmap offset, equal to handle */
++};
++
++/*
++ * F1: a bounded text line for the bring-up log.  There is no usable file
++ * readback path from the host (the root is HFS+ and Android cannot mount it),
++ * so a userspace probe writes its verdict through the kernel's IOLog, which
++ * lands in the console ring the recovery path already pulls.  The struct is
++ * in/out so a client can use one buffer for the call; status is 1 when the
++ * line was accepted.  This selector is diagnostic, not a Mesa interface.
++ */
++#define SM_LOG_MAX              240u
++struct sm_log {
++	uint32_t size;          /* in: bytes used, 1..SM_LOG_MAX */
++	uint32_t status;        /* out: 1 = logged */
++	char text[SM_LOG_MAX];  /* in: NUL not required */
++};
++
+ #endif /* _BSD_DEV_SWEET_MALI_ABI_H_ */
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+index a7c3388..f38de89 100644
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -147,26 +147,48 @@ SweetMaliUserClient::clientClose(void)
+ 	/*
+ 	 * Release the client's GPU memory before the task disappears: a BO's
+ 	 * memory is the client's, and the GPU may still be pointed at it.
+-	 * D2's handle table is global (the probe has one client), so "all" is
+-	 * exactly this client's set; a per-client table arrives with
+-	 * MMAP_BO/B2, which is when two clients can hold BOs at once.
++	 * F1/B2 makes the handle table shared by the probe suite and a real
++	 * userspace client, so the owner argument keeps this close from
++	 * touching another client's BOs or fences.
+ 	 */
+-	sm_bo_close_all();
+-	sm_syncobj_close_all();
++	sm_bo_close_all(this);
++	sm_syncobj_close_all(this);
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+ 
+ /*
+- * D2's door: a client will map its own GPU memory through a type here.
+- * Refusing with kIOReturnUnsupported until then is deliberate -- a client
+- * that gets a mapping it cannot trust is worse than one that gets an error.
++ * F1/B2: the client's own window into a BO.  `type` is the mmap offset that
++ * CREATE_BO/MMAP_BO handed out, which is the BO handle.  sm_bo_info() checks
++ * that this connection owns the handle before any physical address is
++ * exposed, then withPhysicalAddress describes the contiguous allocation for
++ * IOKit to map into the client task.  The BO is normal cacheable memory;
++ * SYNC_BO is what makes the CPU writes visible to the non-coherent GPU.
+  */
+ IOReturn
+-SweetMaliUserClient::clientMemoryForType(__unused uint32_t type,
+-    __unused IOOptionBits *options, __unused IOMemoryDescriptor **memory)
++SweetMaliUserClient::clientMemoryForType(uint32_t type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
+ {
+-	return kIOReturnUnsupported;
++	uint64_t pa, size;
++	IOMemoryDescriptor *md;
++
++	if (memory == NULL) {
++		return kIOReturnBadArgument;
++	}
++	*memory = NULL;
++	if (sm_bo_info(type, this, &pa, &size) != 0) {
++		return kIOReturnBadArgument;
++	}
++	md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,
++	    (IOByteCount)size, kIODirectionInOut);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (options != NULL) {
++		*options = kIOMapDefaultCache;
++	}
++	*memory = md;
++	return kIOReturnSuccess;
+ }
+ 
+ /* ---- argument plumbing ------------------------------------------- */
+@@ -279,7 +301,7 @@ sm_uc_get_param(IOExternalMethodArguments *args)
+  * than a BO whose last bytes are unmapped in a way only the GPU would notice.
+  */
+ static IOReturn
+-sm_uc_create_bo(IOExternalMethodArguments *args)
++sm_uc_create_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_create_bo c;
+ 	uint32_t handle = 0;
+@@ -295,7 +317,7 @@ sm_uc_create_bo(IOExternalMethodArguments *args)
+ 	if (!sm_gpu_ready()) {
+ 		return kIOReturnNotReady;
+ 	}
+-	rc = sm_bo_create(c.size, &handle);
++	rc = sm_bo_create(c.size, client, &handle);
+ 	switch (rc) {
+ 	case 0:
+ 		break;
+@@ -322,7 +344,7 @@ sm_uc_create_bo(IOExternalMethodArguments *args)
+ 		 * close it.  Roll it back instead.
+ 		 */
+ 		if (ret != kIOReturnSuccess) {
+-			sm_bo_destroy(handle);
++			sm_bo_destroy(handle, client);
+ 		}
+ 		return ret;
+ 	}
+@@ -334,14 +356,17 @@ sm_uc_create_bo(IOExternalMethodArguments *args)
+  * userspace half never does VA arithmetic of its own.
+  */
+ static IOReturn
+-sm_uc_get_bo_offset(IOExternalMethodArguments *args)
++sm_uc_get_bo_offset(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_get_bo_offset g;
+-	uint64_t va;
++	uint64_t pa, size, va;
+ 
+ 	if (sm_uc_in(args, &g, sizeof(g)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (sm_bo_info(g.handle, client, &pa, &size) != 0) {
++		return kIOReturnBadArgument;
++	}
+ 	va = sm_bo_va(g.handle);
+ 	if (va == 0) {
+ 		return kIOReturnBadArgument;
+@@ -352,14 +377,14 @@ sm_uc_get_bo_offset(IOExternalMethodArguments *args)
+ }
+ 
+ static IOReturn
+-sm_uc_close_bo(IOExternalMethodArguments *args)
++sm_uc_close_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_close_bo c;
+ 
+ 	if (sm_uc_in(args, &c, sizeof(c)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sm_bo_destroy(c.handle) != 0) {
++	if (sm_bo_destroy(c.handle, client) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	return kIOReturnSuccess;
+@@ -377,7 +402,7 @@ sm_uc_close_bo(IOExternalMethodArguments *args)
+  * returns kIOReturnNotReady instead of blocking the client.
+  */
+ static IOReturn
+-sm_uc_submit(IOExternalMethodArguments *args)
++sm_uc_submit(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_submit s;
+ 	uint32_t rawstat = 0;
+@@ -392,7 +417,8 @@ sm_uc_submit(IOExternalMethodArguments *args)
+ 		return kIOReturnBadArgument;
+ 	}
+ 	rc = sm_client_submit(s.jc, s.bo_handles, s.bo_count,
+-	    (uint32_t)s.out_sync, s.in_syncs, s.in_sync_count, &rawstat);
++	    (uint32_t)s.out_sync, s.in_syncs, s.in_sync_count, client,
++	    &rawstat);
+ 	s.rawstat = rawstat;
+ 	if (rc == SM_SUBMIT_OK) {
+ 		return sm_uc_out(args, &s, sizeof(s));
+@@ -418,14 +444,18 @@ sm_uc_submit(IOExternalMethodArguments *args)
+  * kIOReturnTimeout plus signaled=0, and can tell "not yet" from "no such BO".
+  */
+ static IOReturn
+-sm_uc_wait_bo(IOExternalMethodArguments *args)
++sm_uc_wait_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_wait_bo w;
++	uint64_t pa, size;
+ 	int rc;
+ 
+ 	if (sm_uc_in(args, &w, sizeof(w)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (sm_bo_info(w.handle, client, &pa, &size) != 0) {
++		return kIOReturnBadArgument;
++	}
+ 	rc = sm_bo_wait(w.handle, w.timeout_ns, &w.signaled);
+ 	if (sm_uc_out(args, &w, sizeof(w)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+@@ -445,13 +475,17 @@ sm_uc_wait_bo(IOExternalMethodArguments *args)
+  * a bad handle/type/range.
+  */
+ static IOReturn
+-sm_uc_sync_bo(IOExternalMethodArguments *args)
++sm_uc_sync_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_sync_bo s;
++	uint64_t pa, size;
+ 
+ 	if (sm_uc_in(args, &s, sizeof(s)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (sm_bo_info(s.handle, client, &pa, &size) != 0) {
++		return kIOReturnBadArgument;
++	}
+ 	if (sm_bo_sync(s.handle, s.type, s.offset, s.size) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -460,14 +494,15 @@ sm_uc_sync_bo(IOExternalMethodArguments *args)
+ 
+ /* SYNCOBJ_CREATE: an unsignalled fence handle, like DRM_SYNCOBJ_CREATE. */
+ static IOReturn
+-sm_uc_syncobj_create(IOExternalMethodArguments *args)
++sm_uc_syncobj_create(SweetMaliUserClient *client,
++    IOExternalMethodArguments *args)
+ {
+ 	struct sm_syncobj_create c;
+ 
+ 	if (sm_uc_in(args, &c, sizeof(c)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sm_syncobj_create(&c.handle) != 0) {
++	if (sm_syncobj_create(client, &c.handle) != 0) {
+ 		return kIOReturnNoResources;
+ 	}
+ 	c.pad = 0;
+@@ -475,14 +510,15 @@ sm_uc_syncobj_create(IOExternalMethodArguments *args)
+ }
+ 
+ static IOReturn
+-sm_uc_syncobj_destroy(IOExternalMethodArguments *args)
++sm_uc_syncobj_destroy(SweetMaliUserClient *client,
++    IOExternalMethodArguments *args)
+ {
+ 	struct sm_syncobj_destroy d;
+ 
+ 	if (sm_uc_in(args, &d, sizeof(d)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sm_syncobj_destroy(d.handle) != 0) {
++	if (sm_syncobj_destroy(d.handle, client) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	return kIOReturnSuccess;
+@@ -493,7 +529,7 @@ sm_uc_syncobj_destroy(IOExternalMethodArguments *args)
+  * struct still goes back (signaled=0), so the client never has to guess.
+  */
+ static IOReturn
+-sm_uc_syncobj_wait(IOExternalMethodArguments *args)
++sm_uc_syncobj_wait(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_syncobj_wait w;
+ 	int rc;
+@@ -501,7 +537,7 @@ sm_uc_syncobj_wait(IOExternalMethodArguments *args)
+ 	if (sm_uc_in(args, &w, sizeof(w)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	rc = sm_syncobj_wait(w.handle, w.timeout_ns, &w.signaled);
++	rc = sm_syncobj_wait(w.handle, client, w.timeout_ns, &w.signaled);
+ 	if (sm_uc_out(args, &w, sizeof(w)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -515,6 +551,59 @@ sm_uc_syncobj_wait(IOExternalMethodArguments *args)
+ 	}
+ }
+ 
++/*
++ * MMAP_BO: validate that this connection owns the handle and return the
++ * offset the client passes to IOConnectMapMemory64() (or to mmap(2) through
++ * the libdrm stand-in).  The mapping itself is clientMemoryForType().
++ */
++static IOReturn
++sm_uc_mmap_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
++{
++	struct sm_mmap_bo m;
++	uint64_t pa, size;
++
++	if (sm_uc_in(args, &m, sizeof(m)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	if (sm_bo_info(m.handle, client, &pa, &size) != 0) {
++		return kIOReturnBadArgument;
++	}
++	m.offset = m.handle;
++	m.pad = 0;
++	return sm_uc_out(args, &m, sizeof(m));
++}
++
++/*
++ * LOG: copy a bounded line to IOLog.  The console ring is the only readback
++ * path the host has (the root is HFS+ and Android cannot mount it), so a
++ * userspace probe's verdict has to travel through the kernel log to survive
++ * the boot.  status is 1 when the line was accepted.
++ */
++static IOReturn
++sm_uc_log(IOExternalMethodArguments *args)
++{
++	struct sm_log l;
++	char text[SM_LOG_MAX + 1];
++	uint32_t n;
++
++	if (sm_uc_in(args, &l, sizeof(l)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	n = l.size;
++	if (n > SM_LOG_MAX) {
++		n = SM_LOG_MAX;
++	}
++	if (n == 0) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(text, l.text, n);
++	text[n] = '\0';
++	IOLog("SWEETMALI F1: %s\n", text);
++	l.size = n;
++	l.status = 1;
++	return sm_uc_out(args, &l, sizeof(l));
++}
++
+ IOReturn
+ SweetMaliUserClient::externalMethod(uint32_t selector,
+     IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
+@@ -526,23 +615,27 @@ SweetMaliUserClient::externalMethod(uint32_t selector,
+ 	case SM_SEL_GET_PARAM:
+ 		return sm_uc_get_param(args);
+ 	case SM_SEL_CREATE_BO:
+-		return sm_uc_create_bo(args);
++		return sm_uc_create_bo(this, args);
+ 	case SM_SEL_GET_BO_OFFSET:
+-		return sm_uc_get_bo_offset(args);
++		return sm_uc_get_bo_offset(this, args);
+ 	case SM_SEL_CLOSE_BO:
+-		return sm_uc_close_bo(args);
++		return sm_uc_close_bo(this, args);
+ 	case SM_SEL_SUBMIT:
+-		return sm_uc_submit(args);
++		return sm_uc_submit(this, args);
+ 	case SM_SEL_WAIT_BO:
+-		return sm_uc_wait_bo(args);
++		return sm_uc_wait_bo(this, args);
+ 	case SM_SEL_SYNC_BO:
+-		return sm_uc_sync_bo(args);
++		return sm_uc_sync_bo(this, args);
+ 	case SM_SEL_SYNCOBJ_CREATE:
+-		return sm_uc_syncobj_create(args);
++		return sm_uc_syncobj_create(this, args);
+ 	case SM_SEL_SYNCOBJ_DESTROY:
+-		return sm_uc_syncobj_destroy(args);
++		return sm_uc_syncobj_destroy(this, args);
+ 	case SM_SEL_SYNCOBJ_WAIT:
+-		return sm_uc_syncobj_wait(args);
++		return sm_uc_syncobj_wait(this, args);
++	case SM_SEL_MMAP_BO:
++		return sm_uc_mmap_bo(this, args);
++	case SM_SEL_LOG:
++		return sm_uc_log(args);
+ 	default:
+ 		/*
+ 		 * Log the first time an unknown selector is used, like the
+@@ -833,10 +926,10 @@ sweet_mali_uc_test_d2(IOUserClient *uc)
+ 
+ out:
+ 	if (have0) {
+-		sm_bo_destroy(h0);
++		sm_bo_destroy(h0, uc);
+ 	}
+ 	if (have1) {
+-		sm_bo_destroy(h1);
++		sm_bo_destroy(h1, uc);
+ 	}
+ 	SM_LOG("%s (%u/%u%s)\n", (nok == ntest && nbad == 0) ? "PASS" : "FAIL",
+ 	    nok, ntest, nbad ? ", see BAD lines above" : "");
+@@ -1260,13 +1353,13 @@ sweet_mali_uc_test_d3(IOUserClient *uc)
+ 
+ out:
+ 	if (have0) {
+-		sm_bo_destroy(h0);
++		sm_bo_destroy(h0, uc);
+ 	}
+ 	if (have1) {
+-		sm_bo_destroy(h1);
++		sm_bo_destroy(h1, uc);
+ 	}
+ 	if (have2) {
+-		sm_bo_destroy(h2);
++		sm_bo_destroy(h2, uc);
+ 	}
+ 	SM_LOG("%s (%u/%u%s)\n", (nok == ntest && nbad == 0) ? "PASS" : "FAIL",
+ 	    nok, ntest, nbad ? ", see BAD lines above" : "");
