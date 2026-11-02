@@ -1,0 +1,241 @@
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -4165,10 +4165,6 @@
+ 		printf("SWEETMALI: internal power failed rc=%d\n", -rc);
+ 		goto out;
+ 	}
+-
+-	sm.ready = TRUE;
+-	printf("SWEETMALI: Mali-G57 ready (model %x rev %x)\n",
+-	    sm.gpu_id, sm.revision);
+ 
+ 	rc = sm_mmu_init();
+ 	if (rc) {
+@@ -4189,6 +4185,27 @@
+ 	}
+ 
+ 	/*
++	 * Only now is the GPU something a client may touch.  Everything above
++	 * -- the MMU, the write-value test and the whole case suite -- owns
++	 * sm.bo[], the GPU VA allocator and the page-table pool, and
++	 * VERSION.ready is what a client gates its first CREATE_BO on:
++	 * sm_bo_create() answers kIOReturnNotReady while it is clear, and the
++	 * userspace client polls VERSION until it is set.
++	 *
++	 * Publishing it at power-on, before any of that had run, let the
++	 * client launchd spawns create, map and close a BO in the middle of
++	 * the suite -- the same handle table, the same allocator -- which is
++	 * how a BO that client still had mapped came to be freed under it
++	 * (pmap_assert_free: ... is a User CPU mapping).  The barrier keeps
++	 * the suite's writes to sm.bo[] visible to the client that reads the
++	 * flag.
++	 */
++	sm.ready = TRUE;
++	__sync_synchronize();
++	printf("SWEETMALI: Mali-G57 ready (model %x rev %x)\n",
++	    sm.gpu_id, sm.revision);
++
++	/*
+ 	 * Stage D1: the IOKit door.  It runs after the GPU suite on purpose --
+ 	 * the suite is what proves the hardware, this stage only proves that a
+ 	 * client can reach it -- and it is a separate stage rather than an sm
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -44,6 +44,48 @@
+ #include <sys/sweet_mali.h>
+ 
+ #define SM_LOG(fmt, ...)  IOLog("SWEETMALI UC: " fmt, ##__VA_ARGS__)
++
++/*
++ * The lock the client door serialises on.
++ *
++ * The core's client entry points -- CREATE_BO/CLOSE_BO/SYNC_BO/WAIT_BO/
++ * SUBMIT/MMAP_BO and the fence calls -- share sm.bo[], sm.sync[], the GPU VA
++ * allocator and the page-table pool, and a normal boot runs two clients at
++ * once: the userspace client launchd spawns, and the in-kernel client stage
++ * D2/D3 opens on the bring-up thread.  They reach the core through
++ * externalMethod(), clientMemoryForType() and clientClose(), so one lock over
++ * those three is enough.  It is an IOLock (a sleeping lck_mtx), and none of
++ * the handlers re-enters the door, so a non-recursive lock is enough.
++ *
++ * The bring-up *thread* is not a client of this door and does not take the
++ * lock: it is kept out of the clients' way by VERSION.ready, which is
++ * published only after the suite that owns the same state has finished (see
++ * sweet_mali_thread() in bsd/dev/sweet_mali.c).
++ *
++ * The helpers tolerate a NULL lock so that a call racing SweetMali::stop()
++ * cannot fault on the freed pointer.
++ */
++static IOLock *sm_client_lock;
++
++static void
++sm_client_lock_take(void)
++{
++	IOLock *lock = sm_client_lock;
++
++	if (lock != NULL) {
++		IOLockLock(lock);
++	}
++}
++
++static void
++sm_client_lock_drop(void)
++{
++	IOLock *lock = sm_client_lock;
++
++	if (lock != NULL) {
++		IOLockUnlock(lock);
++	}
++}
+ 
+ /* ------------------------------------------------------------------ *
+  * The service
+@@ -79,6 +121,14 @@
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	/*
++	 * Allocated before IOKit can route an IOServiceOpen to a user client,
++	 * and only once: start() may be called again if the service is
++	 * restarted.
++	 */
++	if (sm_client_lock == NULL) {
++		sm_client_lock = IOLockAlloc();
++	}
+ 	setProperty(kIOUserClientClassKey, SM_USER_CLIENT_CLASS);
+ 	registerService();
+ 	SM_LOG("service registered (%s, gpu %s)\n", SM_SERVICE_NAME,
+@@ -90,6 +140,15 @@
+ SweetMali::stop(IOService *provider)
+ {
+ 	SM_LOG("service stopping\n");
++	/*
++	 * There is no client left by the time a service stops, so the lock can
++	 * go with the last of them; the take/drop helpers treat a NULL lock as
++	 * "nothing to do".
++	 */
++	if (sm_client_lock != NULL) {
++		IOLockFree(sm_client_lock);
++		sm_client_lock = NULL;
++	}
+ 	IOService::stop(provider);
+ }
+ 
+@@ -149,10 +208,15 @@
+ 	 * memory is the client's, and the GPU may still be pointed at it.
+ 	 * F1/B2 makes the handle table shared by the probe suite and a real
+ 	 * userspace client, so the owner argument keeps this close from
+-	 * touching another client's BOs or fences.
++	 * touching another client's BOs or fences.  The close walks the same
++	 * tables the selectors walk, so it takes the door's lock; terminate()
++	 * stays outside it, since it tears IOKit state down rather than the
++	 * core's.
+ 	 */
++	sm_client_lock_take();
+ 	sm_bo_close_all(this);
+ 	sm_syncobj_close_all(this);
++	sm_client_lock_drop();
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -176,9 +240,18 @@
+ 		return kIOReturnBadArgument;
+ 	}
+ 	*memory = NULL;
++	/*
++	 * The ownership check reads a BO table that another client's close may
++	 * be walking; hold the door's lock across it.  The descriptor itself is
++	 * built after the lock is dropped -- it needs the PA and the size, not
++	 * the table -- so no allocation happens under the lock.
++	 */
++	sm_client_lock_take();
+ 	if (sm_bo_info(type, this, &pa, &size) != 0) {
++		sm_client_lock_drop();
+ 		return kIOReturnBadArgument;
+ 	}
++	sm_client_lock_drop();
+ 	md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,
+ 	    (IOByteCount)size, kIODirectionInOut);
+ 	if (md == NULL) {
+@@ -609,33 +682,54 @@
+     IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
+     __unused OSObject *target, __unused void *reference)
+ {
++	IOReturn ret;
++
++	/*
++	 * One lock for the whole switch: every selector below reads or writes
++	 * state the other clients share.  The unknown-selector case is inside
++	 * it too, so the "seen" bitmap keeps its own race off the console.
++	 */
++	sm_client_lock_take();
+ 	switch (selector) {
+ 	case SM_SEL_VERSION:
+-		return sm_uc_version(args);
++		ret = sm_uc_version(args);
++		break;
+ 	case SM_SEL_GET_PARAM:
+-		return sm_uc_get_param(args);
++		ret = sm_uc_get_param(args);
++		break;
+ 	case SM_SEL_CREATE_BO:
+-		return sm_uc_create_bo(this, args);
++		ret = sm_uc_create_bo(this, args);
++		break;
+ 	case SM_SEL_GET_BO_OFFSET:
+-		return sm_uc_get_bo_offset(this, args);
++		ret = sm_uc_get_bo_offset(this, args);
++		break;
+ 	case SM_SEL_CLOSE_BO:
+-		return sm_uc_close_bo(this, args);
++		ret = sm_uc_close_bo(this, args);
++		break;
+ 	case SM_SEL_SUBMIT:
+-		return sm_uc_submit(this, args);
++		ret = sm_uc_submit(this, args);
++		break;
+ 	case SM_SEL_WAIT_BO:
+-		return sm_uc_wait_bo(this, args);
++		ret = sm_uc_wait_bo(this, args);
++		break;
+ 	case SM_SEL_SYNC_BO:
+-		return sm_uc_sync_bo(this, args);
+-	case SM_SEL_SYNCOBJ_CREATE:
+-		return sm_uc_syncobj_create(this, args);
++		ret = sm_uc_sync_bo(this, args);
++		break;
++	case SM_SEL_SYNCOBJ_CREATE:
++		ret = sm_uc_syncobj_create(this, args);
++		break;
+ 	case SM_SEL_SYNCOBJ_DESTROY:
+-		return sm_uc_syncobj_destroy(this, args);
++		ret = sm_uc_syncobj_destroy(this, args);
++		break;
+ 	case SM_SEL_SYNCOBJ_WAIT:
+-		return sm_uc_syncobj_wait(this, args);
++		ret = sm_uc_syncobj_wait(this, args);
++		break;
+ 	case SM_SEL_MMAP_BO:
+-		return sm_uc_mmap_bo(this, args);
++		ret = sm_uc_mmap_bo(this, args);
++		break;
+ 	case SM_SEL_LOG:
+-		return sm_uc_log(args);
++		ret = sm_uc_log(args);
++		break;
+ 	default:
+ 		/*
+ 		 * Log the first time an unknown selector is used, like the
+@@ -651,8 +745,11 @@
+ 				SM_LOG("selector %u unsupported\n", selector);
+ 			}
+ 		}
+-		return kIOReturnUnsupported;
++		ret = kIOReturnUnsupported;
++		break;
+ 	}
++	sm_client_lock_drop();
++	return ret;
+ }
+ 
+ /* ------------------------------------------------------------------ *
