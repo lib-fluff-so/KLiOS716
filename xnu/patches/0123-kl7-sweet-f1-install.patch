@@ -1,0 +1,315 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ef7aa7a..98b931a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_mali.c			standard
++bsd/dev/sweet_f1_install.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_f1_install.c b/bsd/dev/sweet_f1_install.c
+new file mode 100644
+index 0000000..bfd053d
+--- /dev/null
++++ b/bsd/dev/sweet_f1_install.c
+@@ -0,0 +1,261 @@
++/*
++ * sweet_f1_install.c: put the F1 userspace probe onto the HFS+ root before
++ * launchd starts.
++ *
++ * The host cannot write the iOS root: it is HFSX/journaled HFS+, Android has
++ * no HFS+ driver, and pulling/flashing the 42 GB partition to add a 100 KB
++ * binary is not a workable iteration loop.  The payload builder therefore
++ * appends a small blob as one more segment of the SWEETXNU payload and puts
++ *   sweetf1=0x<phys>,0x<size>
++ * on the kernel command line.  The shim copies every payload segment to its
++ * physical address (the blob lands page-aligned), and this file reads it back
++ * through ml_io_map() and writes the files with the kernel's own journaled
++ * HFS+ path.  It runs from bsd_init() after the root vnode exists and before
++ * load_init_program(), so the LaunchDaemon plist is in place when launchd
++ * scans /System/Library/LaunchDaemons.
++ *
++ * Blob format (little endian, all offsets from the blob start):
++ *
++ *   0x00  char     magic[4] = "SMF1"
++ *   0x04  uint32_t version = 1
++ *   0x08  uint32_t count   = 1..F1_MAX_ENTRIES
++ *   0x0c  entries[count]:
++ *           uint32_t path_len     (1..127, path is not NUL terminated)
++ *           uint32_t mode         (permission bits used, e.g. 0755)
++ *           uint32_t data_len
++ *           uint8_t  path[path_len]
++ *           uint8_t  data[data_len]
++ *           pad to a 4-byte boundary
++ *
++ * The builder is host-side (tools/mkf1blob.py); the kernel only has to be
++ * able to refuse a truncated or absurd blob, which every bound below does.
++ * This is a bring-up installer, not a filesystem service: it writes only the
++ * files the blob names, and only when the boot arg is present.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/types.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/errno.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <stdint.h>
++
++#define F1_BLOB_MAGIC0          'S'
++#define F1_BLOB_MAGIC1          'M'
++#define F1_BLOB_MAGIC2          'F'
++#define F1_BLOB_MAGIC3          '1'
++#define F1_BLOB_VERSION         1u
++#define F1_MAX_BLOB             (4u * 1024u * 1024u)
++#define F1_MAX_ENTRIES          8u
++#define F1_HEADER_SIZE          12u
++#define F1_ENTRY_HEADER_SIZE    12u
++#define F1_MAX_PATH             128u
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static uint32_t
++f1_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static int
++f1_hexval(char c)
++{
++	if (c >= '0' && c <= '9') {
++		return c - '0';
++	}
++	if (c >= 'a' && c <= 'f') {
++		return c - 'a' + 10;
++	}
++	if (c >= 'A' && c <= 'F') {
++		return c - 'A' + 10;
++	}
++	return -1;
++}
++
++static int
++f1_parse_hex(const char **pp, uint64_t *out)
++{
++	const char *p = *pp;
++	uint64_t v = 0;
++	int n = 0;
++	int d;
++
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		p += 2;
++	}
++	while ((d = f1_hexval(*p)) >= 0) {
++		if (v > (UINT64_MAX >> 4)) {
++			return -1;
++		}
++		v = (v << 4) | (uint64_t)d;
++		p++;
++		n++;
++	}
++	if (n == 0 || n > 16) {
++		return -1;
++	}
++	*out = v;
++	*pp = p;
++	return 0;
++}
++
++static int
++f1_parse_pair(const char *arg, uint64_t *pa, uint64_t *size)
++{
++	const char *p = arg;
++
++	if (f1_parse_hex(&p, pa) != 0 || *p != ',') {
++		return -1;
++	}
++	p++;
++	if (f1_parse_hex(&p, size) != 0 || *p != '\0') {
++		return -1;
++	}
++	return 0;
++}
++
++/*
++ * Write one file through the journaled root.  vnode_open() is the in-kernel
++ * open(2); the kernel context is root, which is what the installer needs, and
++ * IO_SYNC makes the data durable before launchd can exec the result.
++ */
++static void
++f1_write_file(vfs_context_t ctx, const char *path, uint32_t mode,
++    const uint8_t *data, uint32_t len)
++{
++	vnode_t vp = NULLVP;
++	int resid = 0;
++	errno_t err;
++
++	if (path[0] != '/') {
++		printf("SWEET F1: refusing relative path\n");
++		return;
++	}
++	err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE,
++	    (int)(mode & 0777u), 0, &vp, ctx);
++	if (err != 0) {
++		printf("SWEET F1: open %s failed err=%d\n", path, err);
++		return;
++	}
++	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)data, (int)len, 0,
++	    UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	vnode_close(vp, FWRITE, ctx);
++	if (err != 0 || resid != 0) {
++		printf("SWEET F1: write %s failed err=%d resid=%d\n", path,
++		    err, resid);
++		return;
++	}
++	printf("SWEET F1: wrote %s (%u bytes, mode %o)\n", path, len,
++	    (unsigned)(mode & 0777u));
++}
++
++void
++sweet_f1_install(void)
++{
++	char arg[128];
++	char path[F1_MAX_PATH];
++	char magic[4];
++	const uint8_t *blob;
++	const uint8_t *cur;
++	const uint8_t *end;
++	vm_offset_t map;
++	vm_offset_t kbuf = 0;
++	vm_size_t off;
++	kern_return_t kr;
++	uint64_t pa, size;
++	uint32_t version, count, i;
++	vfs_context_t ctx;
++
++	if (!PE_parse_boot_argn("sweetf1", arg, sizeof(arg))) {
++		return;
++	}
++	if (f1_parse_pair(arg, &pa, &size) != 0 || size == 0 ||
++	    size > F1_MAX_BLOB) {
++		printf("SWEET F1: bad sweetf1 arg '%s'\n", arg);
++		return;
++	}
++	map = ml_io_map((vm_offset_t)pa, (vm_size_t)size);
++	if (map == 0) {
++		printf("SWEET F1: map failed pa=0x%llx size=0x%llx\n",
++		    (unsigned long long)pa, (unsigned long long)size);
++		return;
++	}
++	/*
++	 * ml_io_map() maps the blob as Device memory (VM_WIMG_IO).  The
++	 * parsers below use byte loads, but memcpy(), memcmp() and the HFS+
++	 * write path may use 8-byte loads; an unaligned Device access is a
++	 * kernel data abort.  Copy the blob byte-wise into Normal memory and
++	 * parse/write from there.
++	 */
++	kr = kmem_alloc(kernel_map, &kbuf, (vm_size_t)size, KMA_DATA,
++	    VM_KERN_MEMORY_BSD);
++	if (kr != KERN_SUCCESS) {
++		printf("SWEET F1: alloc failed size=0x%llx kr=%d\n",
++		    (unsigned long long)size, kr);
++		return;
++	}
++	for (off = 0; off < (vm_size_t)size; off++) {
++		((volatile uint8_t *)kbuf)[off] =
++		    ((const volatile uint8_t *)map)[off];
++	}
++	blob = (const uint8_t *)kbuf;
++	magic[0] = F1_BLOB_MAGIC0;
++	magic[1] = F1_BLOB_MAGIC1;
++	magic[2] = F1_BLOB_MAGIC2;
++	magic[3] = F1_BLOB_MAGIC3;
++	if (memcmp(blob, magic, sizeof(magic)) != 0) {
++		printf("SWEET F1: bad blob magic\n");
++		goto done;
++	}
++	version = f1_le32(blob + 4);
++	count = f1_le32(blob + 8);
++	if (version != F1_BLOB_VERSION || count == 0 ||
++	    count > F1_MAX_ENTRIES) {
++		printf("SWEET F1: bad blob header version=%u count=%u\n",
++		    version, count);
++		goto done;
++	}
++	ctx = vfs_context_kernel();
++	cur = blob + F1_HEADER_SIZE;
++	end = blob + size;
++	for (i = 0; i < count; i++) {
++		uint32_t path_len, mode, data_len;
++
++		if ((size_t)(end - cur) < F1_ENTRY_HEADER_SIZE) {
++			printf("SWEET F1: entry %u truncated\n", i);
++			goto done;
++		}
++		path_len = f1_le32(cur);
++		mode = f1_le32(cur + 4);
++		data_len = f1_le32(cur + 8);
++		cur += F1_ENTRY_HEADER_SIZE;
++		if (path_len == 0 || path_len >= F1_MAX_PATH ||
++		    (uint64_t)(end - cur) < (uint64_t)path_len +
++		    (uint64_t)data_len) {
++			printf("SWEET F1: entry %u bad sizes\n", i);
++			goto done;
++		}
++		memcpy(path, cur, path_len);
++		path[path_len] = '\0';
++		cur += path_len;
++		f1_write_file(ctx, path, mode, cur, data_len);
++		cur += data_len;
++		cur = (const uint8_t *)(((uintptr_t)cur + 3u) &
++		    ~(uintptr_t)3u);
++	}
++	printf("SWEET F1: install complete (%u files)\n", count);
++
++done:
++	kmem_free(kernel_map, kbuf, (vm_size_t)size);
++}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 62a38aa..9fcf86b 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -405,6 +405,15 @@ void (*unmountroot_pre_hook)(void);
+ #endif
+ void set_rootvnode(vnode_t);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * F1: the root is HFS+ and the host cannot write it, so the payload carries
++ * a small blob that this hook installs with the kernel's own vnode path just
++ * before launchd starts.  Defined in bsd/dev/sweet_f1_install.c.
++ */
++extern void sweet_f1_install(void);
++#endif
++
+ extern lck_rw_t rootvnode_rw_lock;
+ 
+ SECURITY_READ_ONLY_LATE(struct mach_vm_range) bsd_pageable_range = {};
+@@ -1098,6 +1107,15 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * F1: the root vnode exists now and launchd has not scanned
++	 * /System/Library/LaunchDaemons yet.  A normal boot has no sweetf1
++	 * boot arg, in which case this returns immediately.
++	 */
++	sweet_f1_install();
++#endif
++
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
