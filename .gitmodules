@@ -1,0 +1,3 @@
+[submodule "shim"]
+	path = shim
+	url = https://github.com/lib-fluff-so/KLiOS716-shim.git
