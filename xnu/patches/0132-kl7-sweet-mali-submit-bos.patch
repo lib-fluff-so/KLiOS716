@@ -1,0 +1,63 @@
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -189,7 +189,18 @@
+  * disagree about a struct because one compiler inserted padding.
+  */
+ #define SM_BO_PAGE_SIZE         0x1000u
+-#define SM_SUBMIT_MAX_BOS       8u
++/*
++ * F3: one panfrost job names *every* buffer the batch touches in a single
++ * SUBMIT -- the batch's own resources (colour buffer, vertex/index buffers),
++ * both BO pools it allocates from (descriptors and shaders), the tiler heap
++ * and the sample-positions table -- so a limit of 8 turned every real draw
++ * into SM_SUBMIT_EBADARG (the exact refusal seen as PANFROST_SUBMIT rc=22).
++ * A job may name as many buffers as a client can hold at all (SM_BO_MAX, 32
++ * below), which is why the two numbers agree; the arrays are inline in struct
++ * sm_submit, so this is the one place the limit is spelled and both sides must
++ * be rebuilt together when it moves.
++ */
++#define SM_SUBMIT_MAX_BOS       32u
+ #define SM_SUBMIT_MAX_SYNCS     8u
+ #define SM_SYNCOBJ_MAX          16u
+ /*
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -574,17 +574,38 @@
+ 	int rc;
+ 
+ 	if (sm_uc_in(args, &s, sizeof(s)) != kIOReturnSuccess) {
++		SM_LOG("submit: bad struct\n");
+ 		return kIOReturnBadArgument;
+ 	}
+ 	if (s.bo_count == 0 || s.bo_count > SM_SUBMIT_MAX_BOS ||
+ 	    (s.out_sync >> 32) != 0 ||
+ 	    s.in_sync_count > SM_SUBMIT_MAX_SYNCS) {
++		SM_LOG("submit: bad args bo_count=%u (max %u) in_sync_count=%u "
++		    "(max %u) out_sync=%#llx\n", s.bo_count, SM_SUBMIT_MAX_BOS,
++		    s.in_sync_count, SM_SUBMIT_MAX_SYNCS,
++		    (unsigned long long)s.out_sync);
+ 		return kIOReturnBadArgument;
+ 	}
+ 	rc = sm_client_submit(s.jc, s.bo_handles, s.bo_count,
+ 	    (uint32_t)s.out_sync, s.in_syncs, s.in_sync_count, client,
+ 	    &rawstat);
+ 	s.rawstat = rawstat;
++	/*
++	 * F3: a job that the core refuses used to leave no trace at all on this
++	 * side -- only the stand-in's errno (EINVAL covers both its own count
++	 * check and every SM_SUBMIT_* the core reports), so which check fired
++	 * was a guess.  Log the outcome (and the job chain address, which is
++	 * what SM_SUBMIT_EJC is about) on both paths.
++	 */
++	if (rc != SM_SUBMIT_OK) {
++		SM_LOG("submit: refused rc=%d bo_count=%u jc=%#llx "
++		    "out_sync=%#llx rawstat=%#x\n", rc, s.bo_count,
++		    (unsigned long long)s.jc, (unsigned long long)s.out_sync,
++		    rawstat);
++	} else {
++		SM_LOG("submit: ok bo_count=%u jc=%#llx rawstat=%#x\n",
++		    s.bo_count, (unsigned long long)s.jc, rawstat);
++	}
+ 	if (rc == SM_SUBMIT_OK) {
+ 		return sm_uc_out(args, &s, sizeof(s));
+ 	}
