@@ -1,0 +1,108 @@
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -61,6 +61,16 @@
+ #define SM_SEL_MMAP_BO          0x0bu   /* in/out: struct sm_mmap_bo */
+ #define SM_SEL_LOG              0x0cu   /* in/out: struct sm_log */
+ 
++/*
++ * F3: the create flags, in the ABI's own spelling.  Mesa's panfrost opens its
++ * context with a sync object that is *already signalled* (pan_context.c: "the
++ * last queued job out_sync") and refuses a context if it cannot have one, so a
++ * client has to be able to ask for it.  It is honest here: no job has taken
++ * the object yet, and every SUBMIT that does take it signals it again when the
++ * job finishes.
++ */
++#define SM_SYNCOBJ_CREATE_SIGNALED 0x1u
++
+ /* The service's class name in the IORegistry, and its user client class. */
+ #define SM_SERVICE_NAME         "SweetMali"
+ #define SM_USER_CLIENT_CLASS    "SweetMaliUserClient"
+@@ -232,7 +242,7 @@
+  */
+ struct sm_syncobj_create {
+ 	uint32_t handle;        /* out */
+-	uint32_t pad;
++	uint32_t flags;         /* in: SM_SYNCOBJ_CREATE_SIGNALED */
+ };
+ 
+ struct sm_syncobj_destroy {
+--- a/bsd/sys/sweet_mali.h
++++ b/bsd/sys/sweet_mali.h
+@@ -115,11 +115,13 @@
+ 
+ /*
+  * A sync object is an opaque handle into the core's fence table.  SUBMIT
+- * signals the out_sync handle when the job finishes, faults or times out;
+- * nothing else signals one in D3.  `sm_syncobj_close_all` is the client
++ * signals the out_sync handle when the job finishes, faults or times out, and
++ * that is the only thing that ever signals one; a caller may ask for an object
++ * that is born signalled (SM_SYNCOBJ_CREATE_SIGNALED), which is what Mesa's
++ * panfrost wants for its context fence.  `sm_syncobj_close_all` is the client
+  * teardown, next to sm_bo_close_all.
+  */
+-int sm_syncobj_create(void *owner, uint32_t *handle);
++int sm_syncobj_create(void *owner, uint32_t flags, uint32_t *handle);
+ int sm_syncobj_destroy(uint32_t handle, void *owner);
+ int sm_syncobj_wait(uint32_t handle, void *owner, int64_t timeout_ns,
+     uint32_t *signaled);
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -2072,11 +2072,12 @@
+ }
+ 
+ int
+-sm_syncobj_create(void *owner, uint32_t *handle)
++sm_syncobj_create(void *owner, uint32_t flags, uint32_t *handle)
+ {
+ 	uint32_t slot;
+ 
+-	if (handle == NULL || !sm.ready) {
++	if (handle == NULL || !sm.ready ||
++	    (flags & ~SM_SYNCOBJ_CREATE_SIGNALED) != 0) {
+ 		return -1;
+ 	}
+ 	for (slot = 0; slot < SM_SYNCOBJ_MAX; slot++) {
+@@ -2088,7 +2089,15 @@
+ 		return -2;
+ 	}
+ 	sm.sync[slot].used = TRUE;
+-	sm.sync[slot].signaled = FALSE;
++	/*
++	 * F3: DRM's DRM_SYNCOBJ_CREATE_SIGNALED.  Mesa's panfrost creates the
++	 * fence it will hand to every SUBMIT already signalled -- before the
++	 * first job it is trivially "no job pending" -- and treats a refusal
++	 * as a failed context.  A synchronous SUBMIT cannot leave it lying:
++	 * by the time the ioctl returns, the job the handle names is over.
++	 */
++	sm.sync[slot].signaled =
++	    (flags & SM_SYNCOBJ_CREATE_SIGNALED) ? TRUE : FALSE;
+ 	sm.sync[slot].owner = owner;
+ 	*handle = slot + 1u;	/* 0 means "no fence", so handles start at 1 */
+ 	return 0;
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -657,7 +657,8 @@
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* SYNCOBJ_CREATE: an unsignalled fence handle, like DRM_SYNCOBJ_CREATE. */
++/* SYNCOBJ_CREATE: a fence handle, like DRM_SYNCOBJ_CREATE, signalled on
++ * request (F3: Mesa's panfrost asks for its context fence that way). */
+ static IOReturn
+ sm_uc_syncobj_create(SweetMaliUserClient *client,
+     IOExternalMethodArguments *args)
+@@ -667,10 +668,12 @@
+ 	if (sm_uc_in(args, &c, sizeof(c)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sm_syncobj_create(client, &c.handle) != 0) {
++	if ((c.flags & ~SM_SYNCOBJ_CREATE_SIGNALED) != 0) {
++		return kIOReturnBadArgument;
++	}
++	if (sm_syncobj_create(client, c.flags, &c.handle) != 0) {
+ 		return kIOReturnNoResources;
+ 	}
+-	c.pad = 0;
+ 	return sm_uc_out(args, &c, sizeof(c));
+ }
+ 
