@@ -1,0 +1,495 @@
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -1749,9 +1749,49 @@
+ 	sm_cache_clean_invalidate(sm.tables,
+ 	    SM_TABLES_TOTAL_PAGES * SM_GPU_PAGE_SIZE);
+ 	(void)sm_as_flush_pt(0, aligned, pages * SM_GPU_PAGE_SIZE);
++}
++
++/*
++ * The allocator's own view of an address: 1 if AS0's tables hold a PTE for it.
++ * This is not the GPU's view -- a translation the MMU still has cached is not
++ * a PTE -- which is exactly why it is separate: it tells "the driver left a
++ * translation behind" apart from "the hardware answered with a stale one".
++ */
++int
++sm_va_mapped(uint64_t va)
++{
++	uint64_t aligned = va & ~(SM_GPU_PAGE_SIZE - 1ull);
++	uint32_t pmd_index, pte_index;
++
++	if (!aligned || !sm.area_pmd) {
++		return 0;
++	}
++	pmd_index = (uint32_t)((aligned >> 21) & 0x1ffull);
++	pte_index = (uint32_t)((aligned >> 12) & 0x1ffull);
++	if ((sm.area_pmd[pmd_index] & 3ull) != SM_LPAE_TABLE_DESC) {
++		return 0;
++	}
++	sm_pt_select(0);
++	return (sm_pt_at(sm.area_pmd[pmd_index] & ~0xfffull)[pte_index] & 1ull)
++	    != 0;
+ }
+ 
+ /*
++ * A VA inside the AS window that `sm_va_alloc` never hands out: the guard the
++ * probe suite's unmapped cases already write to.  A write there must fault,
++ * and unlike a VA that CLOSE_BO has just freed it cannot be answered by a
++ * translation that outlived its BO -- measured: the D3 fault test wrote to a
++ * freed VA at area+0x2000 and did not fault in one boot, and wrote to
++ * area+0x3000 and faulted in the next, so the boot's allocator history, not
++ * the driver, was deciding.
++ */
++uint64_t
++sm_va_guard(void)
++{
++	return SM_VA_AREA_BASE + SM_VA_GUARD_OFF;
++}
++
++/*
+  * ---------------------------------------------------------------------------
+  * B1: BO handles
+  * ---------------------------------------------------------------------------
+@@ -2749,16 +2789,32 @@
+ int
+ sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+     uint32_t out_sync, const uint32_t *in_syncs, uint32_t in_count,
+-    void *owner, uint32_t *rawstat)
++    uint32_t requirements, void *owner, uint32_t *rawstat)
+ {
+ 	struct sm_bo *jb = NULL;
++	uint32_t jb_handle = 0;
+ 	uint32_t status;
+ 	uint32_t mmu;
++	uint32_t slot;
++	uint32_t hoff;
++	uint32_t hdr[16];
+ 	uint32_t i;
+ 
+ 	if (!sm.ready || sm.gpu == 0) {
+ 		return SM_SUBMIT_ENOTREADY;
+ 	}
++	/*
++	 * F3: which job slot the chain belongs on is the client's to say, not
++	 * the kernel's to assume.  JS0 is the fragment slot and JS1 the
++	 * vertex/tiler one (the ABI's version 4 note has the evidence); a
++	 * whole chain -- cache flush, tiler, vertex -- travels together, so
++	 * the answer is one slot per submission.  A requirement this port does
++	 * not implement is refused rather than ignored.
++	 */
++	if ((requirements & ~SM_SUBMIT_REQ_ALL) != 0) {
++		return SM_SUBMIT_EBADARG;
++	}
++	slot = (requirements & SM_SUBMIT_REQ_FS) != 0 ? 0u : 1u;
+ 	if (handles == NULL || count == 0 || count > SM_SUBMIT_MAX_BOS ||
+ 	    (jc & 3ull) != 0 || in_count > SM_SUBMIT_MAX_SYNCS ||
+ 	    (in_count > 0 && in_syncs == NULL)) {
+@@ -2785,6 +2841,7 @@
+ 		if (jb == NULL && jc >= bo->gpu_va &&
+ 		    jc < bo->gpu_va + bo->size) {
+ 			jb = bo;
++			jb_handle = h;
+ 		}
+ 	}
+ 	if (jb == NULL) {
+@@ -2814,6 +2871,17 @@
+ 		    sm.bo[handles[i]].size);
+ 	}
+ 	/*
++	 * F3: DATA_INVALID_FAULT names no address.  The header's words 0..3
++	 * are the exception record the hardware writes, so the descriptor the
++	 * client built is only visible in a copy taken before the doorbell.
++	 * Sixteen words is the smallest descriptor this driver knows (the
++	 * write-value job) and the check above keeps it inside the BO.
++	 */
++	hoff = (uint32_t)(jc - jb->gpu_va);
++	for (i = 0; i < 16; i++) {
++		hdr[i] = ((volatile uint32_t *)jb->kva)[hoff / 4u + i];
++	}
++	/*
+ 	 * JS_HEAD is a GPU address: the job front-end fetches the descriptor
+ 	 * through the AS's MMU, exactly as panfrost's panfrost_job_hw_submit()
+ 	 * writes job->jc (a VA) and never translates it.  The probe suite's
+@@ -2822,7 +2890,7 @@
+ 	 * VA, which is the path this stage exists to prove.
+ 	 */
+ 	status = sm_job_submit(jc, SM_JS_CONFIG_BASE | SM_JS_CONFIG_START_MMU,
+-	    sm.shader_present, 0);
++	    sm.shader_present, slot);
+ 	/*
+ 	 * An MMU fault is latched in MMU_INT_RAWSTAT, not in the job slot's
+ 	 * completion/fault bits: the slot stalls at JS_STATUS 8 and the job
+@@ -2843,14 +2911,81 @@
+ 	if (rawstat != NULL) {
+ 		*rawstat = status;
+ 	}
+-	if ((status & (1u << 16)) || mmu != 0) {
++	if ((status & (1u << (16u + slot))) || mmu != 0) {
+ 		int rc;
+ 
+ 		printf("SWEETMALI: SUBMIT fault rawstat=%x js=%x mmu=%x "
+-		    "addr=%x%x\n", status,
+-		    sm_rd(sm.gpu + SM_JS_STATUS(0)), mmu,
++		    "addr=%x%x slot=%u reqs=%#x\n", status,
++		    sm_rd(sm.gpu + SM_JS_STATUS(slot)), mmu,
+ 		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_HI(0)),
+-		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_LO(0)));
++		    sm_rd(sm.gpu + SM_AS_FAULTADDRESS_LO(0)), slot,
++		    requirements);
++		/*
++		 * F3: the witnesses for a fault that names no address.  The
++		 * descriptor as the client built it, next to the same words
++		 * now -- the hardware writes the exception record over them
++		 * (word 0 low byte = JS_STATUS, bits 8-9 = access type, word 1
++		 * = first incomplete task, words 2-3 = the pointer to the
++		 * structure it rejected), so a difference *is* the record.
++		 * Then the first words of every listed BO, which is where an
++		 * all-zero structure the job reads would show up.
++		 */
++		printf("SWEETMALI: JT slot=%u jc=%#llx bo=%u va=%#llx size=%#x "
++		    "off=%#x config=%x\n", slot, jc, jb_handle, jb->gpu_va,
++		    jb->size, hoff, sm_rd(sm.gpu + SM_JS_CONFIG_NEXT(slot)));
++		for (i = 0; i < 16; i += 4) {
++			volatile uint32_t *nw = &((volatile uint32_t *)jb->kva)
++			    [hoff / 4u + i];
++
++			printf("SWEETMALI: JT w[%u..%u] was=%x/%x/%x/%x "
++			    "now=%x/%x/%x/%x\n", i, i + 3u, hdr[i], hdr[i + 1u],
++			    hdr[i + 2u], hdr[i + 3u], nw[0], nw[1], nw[2], nw[3]);
++		}
++		{
++			volatile uint32_t *w = &((volatile uint32_t *)jb->kva)
++			    [hoff / 4u];
++			uint32_t ex = w[0];
++			uint64_t fp = ((uint64_t)w[3] << 32) | (uint64_t)w[2];
++			uint32_t k;
++			int named = 0;
++
++			printf("SWEETMALI: JT ex=%#x js_status=%#x access=%u "
++			    "fic=%#x fault_ptr=%#llx\n", ex, ex & 0xffu,
++			    (ex >> 8) & 3u, w[1], (unsigned long long)fp);
++			for (k = 0; k < count; k++) {
++				struct sm_bo *b = &sm.bo[handles[k]];
++				int here = fp != 0 && fp >= b->gpu_va &&
++				    fp < b->gpu_va + b->size;
++
++				if (b->size < 16u) {
++					printf("SWEETMALI: JT bo[%u] h=%u "
++					    "va=%#llx size=%#x%s\n", k,
++					    handles[k], b->gpu_va, b->size,
++					    b == jb ? " <-jc" : "");
++					continue;
++				}
++				printf("SWEETMALI: JT bo[%u] h=%u va=%#llx "
++				    "size=%#x w0=%x/%x/%x/%x%s\n", k,
++				    handles[k], b->gpu_va, b->size,
++				    ((volatile uint32_t *)b->kva)[0],
++				    ((volatile uint32_t *)b->kva)[1],
++				    ((volatile uint32_t *)b->kva)[2],
++				    ((volatile uint32_t *)b->kva)[3],
++				    b == jb ? " <-jc" : "");
++				if (here) {
++					named = 1;
++					printf("SWEETMALI: JT fault_ptr -> "
++					    "h=%u + %#llx\n", handles[k],
++					    (unsigned long long)(fp - b->gpu_va));
++				}
++			}
++			if (fp == 0) {
++				printf("SWEETMALI: JT fault_ptr is null\n");
++			} else if (!named) {
++				printf("SWEETMALI: JT fault_ptr in no listed "
++				    "BO\n");
++			}
++		}
+ 		rc = sm_case_reset();
+ 		sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
+ 		if (rc != 0) {
+@@ -2859,9 +2994,15 @@
+ 		}
+ 		return SM_SUBMIT_EGPUFAULT;
+ 	}
+-	if ((status & 1u) == 0) {
+-		printf("SWEETMALI: SUBMIT timeout rawstat=%x js=%x mmu=%x\n",
+-		    status, sm_rd(sm.gpu + SM_JS_STATUS(0)), mmu);
++	/*
++	 * The completion bit belongs to the slot the chain ran on: bit 0 is
++	 * JS0's own, bit 16+slot is its fault.  Reading the other slot's
++	 * status here would report "timeout" for a job that succeeded.
++	 */
++	if ((status & (1u << slot)) == 0) {
++		printf("SWEETMALI: SUBMIT timeout rawstat=%x js=%x mmu=%x "
++		    "slot=%u reqs=%#x\n", status,
++		    sm_rd(sm.gpu + SM_JS_STATUS(slot)), mmu, slot, requirements);
+ 		(void)sm_case_reset();
+ 		sm_wr(sm.gpu + SM_MMU_INT_CLEAR, 0xffffffffu);
+ 		return SM_SUBMIT_ETIMEOUT;
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -42,10 +42,22 @@
+  *        inline arrays (one panfrost job names every BO of the batch);
+  *      - sm_create_bo grows a `gpu_va` answer, the BO's address in the GPU
+  *        address space, without which no job chain address means anything.
++ * 4: F3 takes the job slot out of the kernel: struct sm_submit's `pad` is now
++ *    `requirements`, the DRM PANFROST_JD_REQ_* word, because the slot is not
++ *    the kernel's to guess.  JS0 is the fragment slot and JS1 the
++ *    vertex/tiler one -- upstream panfrost (PANFROST_JD_REQ_FS -> JS0,
++ *    anything else -> JS1) and MediaTek's kbase agree on that split, and this
++ *    kernel's own panel demo already submits its IDVS job on JS1 and its
++ *    fragment job on JS0.  A vertex/tiler job started on JS0 is refused by
++ *    the hardware with DATA_INVALID_FAULT (JS_STATUS 0x58), which is what
++ *    every panfrost job chain hit while the slot was hard-coded.  The
++ *    kernel's own user-client self-test says which slot its jobs want too:
++ *    they are the panel demo's fragment-class write-value job, so it asks for
++ *    JS0, and its "the job completed" checks keep reading JS0's bit.
+  * F1/B2 added only selectors and new structs; no existing layout changed
+  * there, which is why it did not move this number.
+  */
+-#define SM_ABI_VERSION          3u
++#define SM_ABI_VERSION          4u
+ 
+ /*
+  * Selectors.  The first block mirrors DRM_IOCTL_PANFROST_*; the second is
+@@ -77,6 +89,18 @@
+  * job finishes.
+  */
+ #define SM_SYNCOBJ_CREATE_SIGNALED 0x1u
++
++/*
++ * F3: the one submission requirement this port implements, spelled exactly as
++ * the DRM ABI spells it (PANFROST_JD_REQ_FS) because the client hands its word
++ * straight through.  Setting it asks for the fragment slot; a submission that
++ * does not set it is a vertex/tiler job and takes the other one.  Any other
++ * bit is refused rather than ignored: cycle counting
++ * (PANFROST_JD_REQ_CYCLE_COUNT) is not implemented here, and a client that
++ * asks for it deserves an answer, not a silently missing counter.
++ */
++#define SM_SUBMIT_REQ_FS        0x1u
++#define SM_SUBMIT_REQ_ALL       0x1u
+ 
+ /* The service's class name in the IORegistry, and its user client class. */
+ #define SM_SERVICE_NAME         "SweetMali"
+@@ -314,7 +338,7 @@
+ struct sm_submit {
+ 	uint64_t jc;            /* in: GPU VA of a job descriptor in a BO */
+ 	uint32_t bo_count;      /* in: 1..SM_SUBMIT_MAX_BOS */
+-	uint32_t pad;
++	uint32_t requirements;  /* in: SM_SUBMIT_REQ_*, i.e. which job slot */
+ 	uint32_t bo_handles[SM_SUBMIT_MAX_BOS]; /* in */
+ 	uint32_t rawstat;       /* out: JOB_INT_RAWSTAT, for diagnosis */
+ 	uint32_t pad2;
+--- a/bsd/sys/sweet_mali.h
++++ b/bsd/sys/sweet_mali.h
+@@ -90,6 +90,16 @@
+ void *sm_bo_kva(uint32_t handle);
+ uint64_t sm_bo_va(uint32_t handle);
+ 
++/*
++ * The VA allocator's own view: 1 if AS0's tables hold a PTE for `va`.  The
++ * fault test needs an address that has none, and "no PTE" against "no fault"
++ * is what separates a driver bug from a hardware one, so the two are told
++ * apart instead of assumed.  `sm_va_guard` is such an address: inside the AS
++ * window, out of the allocator's reach.
++ */
++int sm_va_mapped(uint64_t va);
++uint64_t sm_va_guard(void);
++
+ /* Error codes for sm_client_submit(); the user client maps them to IOReturn. */
+ #define SM_SUBMIT_OK            0
+ #define SM_SUBMIT_ENOTREADY    -1
+@@ -101,7 +111,7 @@
+ 
+ int sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+     uint32_t out_sync, const uint32_t *in_syncs, uint32_t in_count,
+-    void *owner, uint32_t *rawstat);
++    uint32_t requirements, void *owner, uint32_t *rawstat);
+ 
+ /* ---- stage D3: fences, waits and cache sync ----------------------- */
+ 
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -597,24 +597,26 @@
+ 		return kIOReturnBadArgument;
+ 	}
+ 	rc = sm_client_submit(s.jc, s.bo_handles, s.bo_count,
+-	    (uint32_t)s.out_sync, s.in_syncs, s.in_sync_count, client,
+-	    &rawstat);
++	    (uint32_t)s.out_sync, s.in_syncs, s.in_sync_count,
++	    s.requirements, client, &rawstat);
+ 	s.rawstat = rawstat;
+ 	/*
+ 	 * F3: a job that the core refuses used to leave no trace at all on this
+ 	 * side -- only the stand-in's errno (EINVAL covers both its own count
+ 	 * check and every SM_SUBMIT_* the core reports), so which check fired
+-	 * was a guess.  Log the outcome (and the job chain address, which is
+-	 * what SM_SUBMIT_EJC is about) on both paths.
++	 * was a guess.  Log the outcome (the job chain address, which is what
++	 * SM_SUBMIT_EJC is about, and the requirements word, which is what
++	 * picks the job slot) on both paths.
+ 	 */
+ 	if (rc != SM_SUBMIT_OK) {
+ 		SM_LOG("submit: refused rc=%d bo_count=%u jc=%#llx "
+-		    "out_sync=%#llx rawstat=%#x\n", rc, s.bo_count,
++		    "out_sync=%#llx reqs=%#x rawstat=%#x\n", rc, s.bo_count,
+ 		    (unsigned long long)s.jc, (unsigned long long)s.out_sync,
+-		    rawstat);
++		    s.requirements, rawstat);
+ 	} else {
+-		SM_LOG("submit: ok bo_count=%u jc=%#llx rawstat=%#x\n",
+-		    s.bo_count, (unsigned long long)s.jc, rawstat);
++		SM_LOG("submit: ok bo_count=%u jc=%#llx reqs=%#x rawstat=%#x\n",
++		    s.bo_count, (unsigned long long)s.jc, s.requirements,
++		    rawstat);
+ 	}
+ 	if (rc == SM_SUBMIT_OK) {
+ 		return sm_uc_out(args, &s, sizeof(s));
+@@ -943,6 +945,23 @@
+ 	args.structureOutput = out;
+ 	args.structureOutputSize = (uint32_t)out_len;
+ 	return SM_UC_CALL(uc, selector, &args);
++}
++
++/*
++ * Every job the self-tests below submit is the same write-value job the panel
++ * demo runs, and that job is fragment-class: it belongs on JS0.  Since ABI
++ * version 4 the slot is no longer the kernel's to pick -- a submission says
++ * which slot it wants, exactly as panfrost says PANFROST_JD_REQ_FS for a
++ * fragment job, and a submission that does not say it is taken for a
++ * vertex/tiler job and runs on JS1.  The self-tests therefore have to say it,
++ * or their "the job completed" checks would read JS1's bit while asserting
++ * JS0's.
++ */
++static void
++sm_uc_submit_init(struct sm_submit *s)
++{
++	memset(s, 0, sizeof(*s));
++	s->requirements = SM_SUBMIT_REQ_FS;
+ }
+ 
+ static void
+@@ -1075,7 +1094,7 @@
+ 	desc[13] = (uint32_t)(SM_D2_VALUE >> 32);
+ 	*target = SM_D2_SENTINEL;
+ 
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 2;
+ 	sub.bo_handles[0] = h0;
+@@ -1090,7 +1109,7 @@
+ 	    (unsigned long long)*target, (unsigned long long)SM_D2_VALUE, kr);
+ 
+ 	/* 10: jc must be inside a *listed* BO */
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 1;
+ 	sub.bo_handles[0] = h1;
+@@ -1101,7 +1120,7 @@
+ 	SM_LOG("%s SUBMIT jc not in listed BO: kr=%x\n", ok ? "ok " : "BAD", kr);
+ 
+ 	/* 11: jc outside every BO is refused before the doorbell */
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0 + 0x20000000ull;
+ 	sub.bo_count = 1;
+ 	sub.bo_handles[0] = h0;
+@@ -1120,6 +1139,20 @@
+ 	if (ok) { nok++; have0 = false; } else nbad++;
+ 	SM_LOG("%s CLOSE_BO 0: kr=%x\n", ok ? "ok " : "BAD", kr);
+ 
++	/*
++	 * The close's own promise, on the CPU side: the PTE is gone.  D3 used
++	 * to check this by writing to the freed address and watching the GPU
++	 * fault, which made the answer depend on whether the allocator had
++	 * already handed that VA to something else -- it faulted on one boot
++	 * and not on the next.  Asking the tables directly is the same claim
++	 * with the GPU out of the way.
++	 */
++	ntest++;
++	ok = (sm_va_mapped(va0) == 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s CLOSE_BO 0 left no PTE at va=%llx\n", ok ? "ok " : "BAD",
++	    (unsigned long long)va0);
++
+ 	memset(&g, 0, sizeof(g));
+ 	g.handle = h0;
+ 	kr = sm_uc_call(uc, SM_SEL_GET_BO_OFFSET, &g, sizeof(g), &g, sizeof(g));
+@@ -1128,7 +1161,7 @@
+ 	if (ok) nok++; else nbad++;
+ 	SM_LOG("%s GET_BO_OFFSET after close: kr=%x\n", ok ? "ok " : "BAD", kr);
+ 
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 1;
+ 	sub.bo_handles[0] = h0;
+@@ -1332,7 +1365,7 @@
+ 	/* 4: a good job, and fence A is signalled when SUBMIT returns */
+ 	sm_d3_job(desc, va1, SM_D3_VALUE1);
+ 	*target = SM_D2_SENTINEL;
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 2;
+ 	sub.bo_handles[0] = h0;
+@@ -1431,7 +1464,7 @@
+ 
+ 	sm_d3_job(desc, va1, SM_D3_VALUE2);
+ 	*target = SM_D2_SENTINEL;
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 2;
+ 	sub.bo_handles[0] = h0;
+@@ -1469,7 +1502,7 @@
+ 
+ 	sm_d3_job(desc, va1, SM_D3_VALUE2);
+ 	*target = SM_D2_SENTINEL;
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 2;
+ 	sub.bo_handles[0] = h0;
+@@ -1484,12 +1517,28 @@
+ 	    ok ? "ok " : "BAD", (unsigned long long)*target, kr);
+ 
+ 	/*
+-	 * 9: the delivery.  A write to the VA CLOSE_BO unmapped must fault,
+-	 * the driver must reset, and the fence must still signal -- otherwise
+-	 * a client waiting on it would hang after a GPU fault.
++	 * 9: the delivery.  A write to an unmapped VA must fault, the driver
++	 * must reset, and the fence must still signal -- otherwise a client
++	 * waiting on it would hang after a GPU fault.
++	 *
++	 * The address is the guard, not the va2 CLOSE_BO just freed: a freed
++	 * VA is only a hole until the allocator hands it out again, and
++	 * whether that has happened is the boot's history rather than the
++	 * driver's behaviour -- the same pass wrote to area+0x2000 without
++	 * faulting in one boot and faulted at area+0x3000 in the next.  The
++	 * guard is inside the AS window and never allocated, so the absence of
++	 * a PTE for it is a property of the address.  That the close really
++	 * does drop the PTE is checked in D2, where the answer is deterministic.
+ 	 */
++	va2 = sm_va_guard();
++	ntest++;
++	ok = (sm_va_mapped(va2) == 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s fault target guard va=%llx has no PTE\n", ok ? "ok " : "BAD",
++	    (unsigned long long)va2);
++
+ 	sm_d3_job(desc, va2, SM_D3_VALUE3);
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 1;
+ 	sub.bo_handles[0] = h0;
+@@ -1515,7 +1564,7 @@
+ 	/* 10: recovery: the same BOs, a good target, a new value */
+ 	sm_d3_job(desc, va1, SM_D3_VALUE3);
+ 	*target = SM_D2_SENTINEL;
+-	memset(&sub, 0, sizeof(sub));
++	sm_uc_submit_init(&sub);
+ 	sub.jc = va0;
+ 	sub.bo_count = 2;
+ 	sub.bo_handles[0] = h0;
