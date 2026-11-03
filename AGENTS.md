@@ -1,9 +1,45 @@
-# Working on the KL7 XNU port
+# Working on KLiOS716
 
-- Read `XNU-KL7-PORT-PLAN.md` first, then the active handoff at the top of `NOTES.md`. The target is Tecno Spark 30 Pro KL7 / MediaTek MT6789 and iOS 16-era `xnu-8796`; Linux ports are out of scope.
-- Treat this tree as a KL7 bring-up overlay based on `ios-sweet`, not as an upstream-ready patch series. `ARM64_BOARD_CONFIG_SWEET` is temporarily reused to compile the common iOS-on-MacOS compatibility layer; do not assume every sweet-named hardware driver applies to KL7.
-- Read the relevant patches in order before editing. Distinguish patch syntax parsing from actually applying patches to xnu-8796 and from compiling XNU. Never report the latter two as passed without a CI/build-tree result.
-- Keep the first device run deliberately small: actual XNU Mach-O, KL7 ADT generated without UFS or `/product`, `cpus=1`, `rd=md0`, WDT disabled at shim handoff. Required evidence is an XNU-originated marker or panic state captured in ramoops; a synthetic shim payload is not XNU validation.
-- Update the active handoff in `NOTES.md` after each milestone. Record exact source revision, CI run, build result, artifact names/hashes and device log facts.
-- Do not touch the user's phone, flash partitions, or run destructive actions as part of local build prep. Preserve Android and backups. USB/iBoot menu, recovery UI, UFS root and SMP come later.
-- Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+Repository rules for anyone -- human or agent -- changing this tree. The
+bench operator's own rules (`~/AGENTS.md` on the build host) win on conflict.
+
+## Kernel changes
+
+- The XNU source of truth is `xnu/patches/`. Never edit the fetched tree by
+  hand: a change counts only as a numbered patch, and the same patch must be
+  in the build host's `~/kbuild/ios-sweet/xnu/patches/`.
+- A new source file needs its `bsd/conf/files` line in the same patch.
+- Build with `MACHINE_CONFIG=SWEET`, `MACOS_VERSION=13.5`,
+  `KERNEL_CONFIG=DEVELOPMENT`, and read the apply log. `0101` is rejected
+  (corrupt) and skipped on purpose, `0110` is retired, `0115`-`0117` are
+  experimental.
+- Before flashing, run the `comm -23` check in `xnu/README.md`: its output
+  must be empty, otherwise the tree holds work the patch set does not
+  provide.
+
+## Device
+
+- Flash `boot_b` only. Never `boot_a`, never recovery/TWRP, nothing through
+  `fastboot boot`.
+- Pack payloads with the `v0127` ADT: `kl7-ufs` base `0x11270000`, 10624
+  bytes. An ADT with `0x10270000` leaves XNU without a root.
+- XNU does not reboot after a failed boot. Power-cycle to BROM,
+  `antumbra set-active-slot a`, reboot, and Android is back.
+
+## Evidence
+
+- A build proves compilation, not boot. A milestone is done when a ring log
+  or a hardware marker says so, together with the exact kernel and image
+  hashes.
+- Keep kernels, images and ring dumps on disk (`/home/fluff_/kl7/artifacts`),
+  never in `/tmp`, and keep only the current and the previous build.
+- Record results in `xnu/HISTORY.md` (patches, builds) and `xnu/NOTES.md`
+  (the lab notebook, including the attempts that failed).
+
+## GPU
+
+- Kernel side: the `0118`-`0136` patches. Userspace side: `gpu/`.
+- Mesa changes live in `gpu/mesa-ios/mesa-sweet.patch` and are applied by
+  `apply.py`; the panfrost driver itself is not edited in place.
+- Install names are absolute (`/var/root/...`). dyld on this port refuses
+  `@rpath`, and `__interpose` does not work for dylib references.

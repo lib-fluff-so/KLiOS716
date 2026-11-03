@@ -1,207 +1,175 @@
-> **KL7 port work is in progress.** For Tecno Spark 30 Pro (MT6789), use [XNU-KL7-PORT-PLAN.md](XNU-KL7-PORT-PLAN.md), `tools/mkadt_kl7.py`, `tools/mkpayload_kl7.py`, and CI `machine_config=KL7`. The original `tools/mkadt.py` and `MACHINE_CONFIG=SWEET` instructions below describe the reference Redmi Note 10 Pro and are not the KL7 hardware profile. The first KL7 milestone is a single-core XNU marker; the Sweet UFS/display/touch drivers are **not** considered KL7-compatible.
+# KLiOS716
 
----
+Apple's **iOS 16 userland running on a TECNO Spark 30 Pro** (KL7, MediaTek
+MT6789, Mali-G57). This repository is the kernel side of that port:
 
-# ios-sweet
+- **the XNU patch train** -- Apple's open-source `xnu-8796` (the iOS 16
+  generation), taken as a patch series on top of the `ios-sweet` SM7150 port
+  and carried forward until it boots this board (`xnu/patches/`, `0001`-`0136`);
+- **the build environment** -- a local macOS VM (QEMU + OpenCore), because no
+  hosted macOS runner is usable for this, plus the ADT, payload, root-image
+  and log helpers in `tools/`;
+- **the GPU userspace** -- `gpu/`: a libdrm stand-in over the kernel's
+  SweetMali user client, and the Mesa/panfrost build that runs on top of it.
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+The ARM64 loader (**the shim**) is a separate repository,
+[KLiOS716-shim](https://github.com/lib-fluff-so/KLiOS716-shim), attached here
+as the `shim/` submodule at a pinned commit. It reads the live DTB and initrd,
+prepares memory and `boot_args`, and branches into XNU; it carries no kernel
+source.
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+The phone dual-boots. Android stays on slot `_a` and is the way back; every
+image here goes to `boot_b`, and the iOS root lives in the `iosroot`
+partition. Nothing is installed by flashing `boot_a`, and recovery/TWRP is
+never used.
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+> Experimental bring-up, not a phone you can use yet. Expect crashes, missing
+> apps, and no power management.
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
-
-## What works
+## Where it stands
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
+| Kernel | `xnu-8796` boots on the board: six Cortex-A55s, 16 KiB pages, GICv3, PSCI, architected timers, MTK UFS |
+| Root | 20H392 (iOS 16.7.16) iPhone X HFS+ root in `iosroot`; launchd and the system daemons run |
+| Display | `AppleCLCD` + IOMobileFramebuffer; CoreAnimation renders in software today |
+| Input | FTS3519 touch (`0112`), power/volume keys and vibration (`0113`), battery telemetry (`0114`) |
+| GPU, kernel | SweetMali: `IOAccelerator` driver, BOs and GPU VAs, jobs, fences, IOSurface-backed BOs (`0118`-`0136`) |
+| GPU, userspace | libdrm over the SweetMali user client, Mesa/panfrost, first triangle via OSMesa (`gpu/`) |
+| Open | EGL/GLES on top of the panfrost winsys so QuartzCore can use the GPU (F2); DVFS/thermal/suspend (G); a usable jailbroken root |
 
-## What does not work (yet)
-
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
+Kernel builds, on-device runs and what each patch fixes are recorded in
+[`xnu/HISTORY.md`](xnu/HISTORY.md). The raw lab notebook, including failed
+attempts, is [`xnu/NOTES.md`](xnu/NOTES.md).
 
 ## How it boots
 
 ```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
+ABL / LK (the bootloader; unlocked)
+  └─ boot_b: shim_b.img                    Android boot image: shim + ramdisk + payload
+       └─ shim/  live FDT + initrd -> SWEETXNU payload (Mach-O + ADT + boot_args)
+            └─ XNU  MTK UFS -> HFS+ root in `iosroot` -> dyld -> launchd
+                 └─ backboardd / SpringBoard -> QuartzCore
 ```
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
+There is no serial console on this board. The kernel keeps a 4 MiB persistent
+log ring at the end of the `iosroot` partition (block 11,000,823; 1025
+blocks of 4 KiB), written through on panic. Reading it needs a raw dump of
+that partition (the BROM/`antumbra` path used by the bench scripts); a
+shim-only failure leaves its console in `/sys/fs/pstore/console-ramoops-0`
+for the next Android boot.
 
-## How to do it yourself
+## Layout
 
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
-
-### 0. Back up the phone
-
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
-
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
-
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
+```
+.
+├── xnu/                      XNU: the patch train, the build wrapper, ios-root helpers
+│   ├── patches/              the patch set, 0001-0136 -- the source of truth
+│   ├── build-xnu.sh          the VM build wrapper (fresh dxb + full patch apply)
+│   ├── HISTORY.md            what each patch does, build by build
+│   ├── NOTES.md              the lab notebook
+│   ├── XNU-KL7-PORT-PLAN.md  the original bring-up plan (historical)
+│   └── ios-root/             offline iOS root preparation
+├── gpu/
+│   ├── mali-sweet/           libdrm.2.dylib over SweetMali, and the F1 test client
+│   └── mesa-ios/             Mesa/panfrost cross-build and the stage runner
+├── vm/                       the macOS build VM (QEMU + OpenCore) and its tools
+├── rootfs/                   generated-root policy
+├── tools/                    ADT, payload, root image, log and inspection helpers
+├── docs/QEMU_TESTING.md      the QEMU harness for the reference `sweet` device
+└── shim/                     KLiOS716-shim, pinned (submodule)
 ```
 
-### 1. Build the kernel
+`tools/` also still carries helpers from the reference `sweet` port
+(`mkadt.py`, `qemu-sweet.py`, `sweet-log-pull.sh`, which pulls through
+OrangeFox and is **not** the KL7 path).
 
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
+## Build the kernel
 
 ```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
+git clone --recurse-submodules https://github.com/lib-fluff-so/KLiOS716.git
+cd KLiOS716
 ```
 
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
-
-### 2. Build the iOS root image
-
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
+The build runs in the macOS VM (`vm/README.md`; SSH on port 2222, Xcode
+installed, `~/kbuild` prepared). The patch set is the source of truth, and
+`build-xnu.sh` re-fetches the XNU tree and re-applies it:
 
 ```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
+rsync -a --delete xnu/patches/ dev@127.0.0.1:~/kbuild/ios-sweet/xnu/patches/
+scp xnu/build-xnu.sh dev@127.0.0.1:~/kbuild/build-xnu.sh
+ssh dev@127.0.0.1 'cd ~/kbuild && MACOS_VERSION=13.5 \
+    KERNEL_CONFIG=DEVELOPMENT MACHINE_CONFIG=SWEET bash build-xnu.sh'
+# -> ~/kbuild/out/kernel.development.sweet
 ```
 
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
+`MACHINE_CONFIG=SWEET`, not `KL7`: the board reuses the `ios-sweet`
+configuration, and the KL7 differences are ordinary patches from `0101` on.
+`0101` is corrupt and skipped by the apply step, `0110` is retired, and
+`0115`-`0117` are experimental. [`xnu/README.md`](xnu/README.md) has the
+rules; `build-fast.sh` gives a ~20 s incremental rebuild of an already
+patched tree.
 
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
+## Build an image and flash it
+
+The payload (kernel + ADT + boot-args) is packed by the shim repository's
+tools, because the container format is the shim's:
 
 ```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
+# the ADT must be the one whose kl7-ufs node has base 0x11270000 (the `v0127`
+# ADT, 10624 bytes). An ADT with 0x10270000 makes the UFS driver probe the
+# wrong registers and the kernel never finds its root.
+python3 shim/tools/mkpayload_xnu.py KERNEL ADT payload.bin --cmdline "..."
 ```
 
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
+Then, with Android up:
 
 ```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-What the less obvious boot-args do:
-
-| Boot-arg | Effect |
-| --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
-
-### 4. Flash the root and boot
-
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
-
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
-
-### 5. Read the kernel log
-
-```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
 adb reboot bootloader
+fastboot flash boot_b  shim_b.img
+fastboot flash iosroot iosroot.img      # only when the root image changed
+fastboot --set-active=b
+fastboot reboot
 ```
 
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
+Rules that are not negotiable:
 
-### QEMU
+- **Never flash `boot_a`.** `boot_b` only, at most 64 MiB. No recovery, no
+  TWRP, no `fastboot boot` into someone else's image.
+- The bootloader reports `ro.boot.flash.locked=1` and a green verified-boot
+  state. Those properties are spoofed; the bootloader is unlocked and
+  flushing works.
+- XNU does not reboot on a failed boot. Power-cycle into BROM, run
+  `antumbra set-active-slot a`, reboot, and Android is back.
 
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
+## The GPU
 
-## Repository layout
+The kernel side is the `0118`-`0136` train (`SweetMali`, an `IOAccelerator`
+driver for the Mali-G57). The userspace side is `gpu/`:
 
-| Path | What |
-| --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
+- `mali-sweet/` -- `libdrm.2.dylib`, a DRM shim that translates
+  `PANFROST_*` ioctls onto the SweetMali user client, plus the F1 test client.
+- `mesa-ios/` -- the Mesa cross-build (`libOSMesa.8.dylib`), the `f1_runner`
+  daemon that runs the stages on the device, and the tests themselves
+  (`f3_test.c`: first triangle, `e_test.c`: the userland half of stage E).
 
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
+Install names are absolute (`/var/root/libdrm.2.dylib`), because dyld on this
+port refuses `@rpath`. Results go to the kernel log ring, so a stage can be
+checked from a post-mortem dump.
 
-## Kernel patches
+## Changing the kernel
 
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
+A change exists only as a numbered patch in `xnu/patches/`. The XNU tree in
+the VM is disposable and is rebuilt from the patch set; anything written
+there by hand is lost by the next `build-xnu.sh`. Adding a source file means
+the file and its `bsd/conf/files` line go into the same patch. Before
+flashing, check that no unmanaged file is left in the build tree -- the
+command prints nothing when the tree and the patch set agree:
 
-## Key hardware facts
+```sh
+comm -23 \
+  <(cd ~/kbuild/dxb/xnu && git status --porcelain | grep '^??' | awk '{print $2}' | sort) \
+  <(grep -h '^+++ b/' ~/kbuild/ios-sweet/xnu/patches/*.patch | sed 's|^+++ b/||' | sort -u)
+```
 
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
-
-## Credits
-
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Full rules: [`xnu/README.md`](xnu/README.md).
