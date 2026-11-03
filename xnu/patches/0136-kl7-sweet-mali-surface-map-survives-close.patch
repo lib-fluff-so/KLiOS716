@@ -1,0 +1,29 @@
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -253,6 +253,26 @@
+ 		return;
+ 	}
+ 	fBoMem[handle] = NULL;
++
++	/*
++	 * E: a surface-backed handle's descriptor is the surface's own, and the
++	 * mapping IOKit made from it is not ours to destroy.  IOKit answers a
++	 * second map of the same descriptor with the map it already made, so the
++	 * window a client gets for a surface BO *is* the surface's own window --
++	 * the one IOSurfaceRootUserClient made when the framework asked for the
++	 * base address.  Unmapping it here would take the surface's base address
++	 * away with the BO: ring-e2f, the client's next read of the pixels
++	 * faults, far = base + 0x100, with the surface's pages gone from its map,
++	 * and in a compositor that is the picture disappearing rather than a BO
++	 * being released.  A mapping is dropped by whoever made it --
++	 * IOSurfaceRootUserClient for its window, the client itself through
++	 * IOConnectUnmapMemory64 for a window it asked for -- so all this owns
++	 * here is the descriptor reference it took in clientMemoryForType().
++	 */
++	if (fSurface[handle] != NULL) {
++		md->release();
++		return;
++	}
+ 
+ 	map = removeMappingForDescriptor(md);
+ 	if (map != NULL) {
