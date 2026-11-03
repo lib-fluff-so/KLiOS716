@@ -2,7 +2,7 @@
 
 The iOS rootfs is generated locally and is not stored in this repository.
 The preparation scripts, sparse manifest, and userland helpers are in
-`xnu/ios-root/`; the main image builder is `xnu/tools/mkiosroot.sh`.
+`xnu/ios-root/`; the main image builder is `tools/mkiosroot.sh`.
 
 Keep these outside git:
 

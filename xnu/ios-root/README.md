@@ -95,12 +95,12 @@ different root without verifying the source image and chunk hashes.
 - The scripts contain bring-up workarounds, not a claim of full iOS
   userspace support. Read the comments and `../../xnu/NOTES.md` before
   changing defaults.
-- The KL7 root work is separate from the shim history. Never flash `boot_a`;
-  see `../../REPOSITORY.md`.
+- The KL7 root work is separate from the shim. Never flash `boot_a`;
+  see `../../README.md`.
 
 ## Related files
 
-- `../../xnu/tools/mkiosroot.sh` - build the HFS+ root volume
-- `../../xnu/tools/mkinit.py` - static `sweet-init` wrapper
+- `../../tools/mkiosroot.sh` - build the HFS+ root volume
+- `../../tools/mkinit.py` - static `sweet-init` wrapper
 - `../../xnu/NOTES.md` - userland/display/GPU history
-- `../../SHIM-HISTORY.md` - shim and on-device chronology
+- `../../README.md` - repository overview and device rules

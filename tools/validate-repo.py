@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Validate this consolidated KL7 tree.
 
-  xnu/tools/validate-repo.py [--verbose]
+  tools/validate-repo.py [--verbose]
 
 Checks:
   1. XNU patch numbering and unified-diff headers in xnu/patches/.
      The KL7 set intentionally has no 0082 (hallucinated/removed) and no
      0110 (absent from the verified VM build). The 0082-0100 range is the
      boundary between the base train and the KL7 train.
-  2. Python syntax for tools/ and xnu/tools/.
+  2. Python syntax for tools/.
   3. Shell syntax for the repo's .sh files.
 
 This is adapted from ios-sweet's root tools/validate-repo.py for the
@@ -23,7 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 PATCH_DIR = ROOT / "xnu" / "patches"
 
 # Intentional holes in the verified set.

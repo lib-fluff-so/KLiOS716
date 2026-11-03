@@ -1,5 +1,5 @@
 #!/bin/bash
-# Local replica of .github/workflows/xnu.yml (ios-sweet), no GitHub Actions needed.
+# Local XNU build: fresh dxb checkout, then the whole patch set. No GitHub Actions.
 # Usage: MACOS_VERSION=13.5 KERNEL_CONFIG=DEVELOPMENT MACHINE_CONFIG=SWEET bash ~/kbuild/build-xnu.sh
 set -euo pipefail
 export PATH=/usr/local/bin:$PATH

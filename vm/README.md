@@ -129,12 +129,12 @@ result.
 - The VM disk and installer media are large; keep them outside git.
 - Shut the VM down cleanly before replacing `img/mac_hdd.img` or the
   OpenCore image.
-- The phone-side safety rules are in `../REPOSITORY.md`: flash only
+- The phone-side safety rules are in `../README.md`: flash only
   `boot_b`, never `boot_a`, and keep `boot_b` at or below 64 MiB.
 
 ## Related files
 
 - `../xnu/README.md` - XNU build and patch set
 - `../xnu/HISTORY.md` - kernel chronology
-- `../REPOSITORY.md` - repository map and phone safety rules
-- `../SHIM-HISTORY.md` - shim/on-device history
+- `../README.md` - repository map, flashing and phone safety rules
+- `../gpu/` - GPU userspace: libdrm stand-in and Mesa/panfrost

@@ -47,4 +47,4 @@ not part of the shim, and not a tested root patch.
 
 - `../README.md` - offline root preparation
 - `../../xnu/NOTES.md` - iOS root and userland history
-- `../../SHIM-HISTORY.md` - on-device chronology
+- `../../README.md` - repository overview and device rules
