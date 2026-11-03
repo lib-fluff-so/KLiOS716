@@ -1,0 +1,59 @@
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -35,10 +35,17 @@
+  * Bumped when a struct below changes meaning; GET_PARAM VERSION returns it.
+  * 2: D3 extends struct sm_submit (out_sync is an input fence handle now,
+  *    in_syncs[] was added) and adds the fence/wait/sync structs.
+- * F1/B2 only adds selectors and new structs; no existing layout changes, so
+- * the version stays 2 and a D3 client keeps working unchanged.
++ * 3: F3 changes layouts D2/D3 clients did share, so the kernel and its client
++ *    must be built together (they ship in one image):
++ *      - sm_syncobj_create's `pad` is `flags` (SM_SYNCOBJ_CREATE_SIGNALED);
++ *      - SM_SUBMIT_MAX_BOS grows 8 -> 32, which grows struct sm_submit's
++ *        inline arrays (one panfrost job names every BO of the batch);
++ *      - sm_create_bo grows a `gpu_va` answer, the BO's address in the GPU
++ *        address space, without which no job chain address means anything.
++ * F1/B2 added only selectors and new structs; no existing layout changed
++ * there, which is why it did not move this number.
+  */
+-#define SM_ABI_VERSION          2u
++#define SM_ABI_VERSION          3u
+ 
+ /*
+  * Selectors.  The first block mirrors DRM_IOCTL_PANFROST_*; the second is
+@@ -228,6 +235,16 @@
+ 	uint64_t offset;        /* out: CPU mmap offset (D2: equals handle) */
+ 	uint32_t handle;        /* out: BO handle for the calls below */
+ 	uint32_t pad;
++	/*
++	 * F3: the BO's GPU address.  It is what a driver needs and what D2
++	 * never had to publish: panfrost takes the address space base of every
++	 * BO from exactly here (panfrost_kmod_bo_alloc(): `bo->offset =
++	 * req.offset`), then expresses the job chain address, every descriptor
++	 * pointer and the tiler heap address in that space.  A client left to
++	 * invent its own addresses builds jobs whose `jc` means nothing to the
++	 * MMU, which is refused before the job ever reaches the GPU.
++	 */
++	uint64_t gpu_va;        /* out: the BO's address in the GPU AS */
+ };
+ 
+ struct sm_get_bo_offset {
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -494,6 +494,16 @@
+ 	 * MMAP_BO can keep it, and a D2 client simply never maps.
+ 	 */
+ 	c.offset = handle;
++	/*
++	 * F3: and the BO's GPU address, which is the whole reason a job can
++	 * name this BO at all.  panfrost's kms path reads it back out of this
++	 * very field (panfrost_kmod_bo_alloc(): `bo->offset = req.offset`) and
++	 * from then on speaks only in it -- the job chain address, every
++	 * descriptor pointer, the tiler heap.  A client that is not told its
++	 * BOs' addresses invents its own (they came out as bare offsets into
++	 * the pool, `jc=0x287`), and the MMU has no mapping there.
++	 */
++	c.gpu_va = sm_bo_va(handle);
+ 	{
+ 		IOReturn ret = sm_uc_out(args, &c, sizeof(c));
+ 
