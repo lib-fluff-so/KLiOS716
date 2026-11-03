@@ -1,0 +1,224 @@
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -31,6 +31,13 @@
+ #include <pexpert/pexpert.h>
+ #include <IOKit/IOLib.h>
+ /*
++ * kmem_alloc()/kernel_map for the scattered BO fallback (see sm_bo_open), and
++ * ml_vtophys() for the per-page physical addresses it maps.
++ */
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <vm/pmap.h>
++/*
+  * memset, for sm_gpu_info_read() below: named explicitly instead of relying on
+  * it arriving transitively, the way bsd/kern/kern_event.c does it.
+  */
+@@ -353,7 +360,14 @@
+ #define SM_VA_AREA_PAGES  ((uint32_t)(SM_VA_AREA_SIZE / SM_GPU_PAGE_SIZE))
+ #define SM_VA_BITMAP_WORDS ((SM_VA_AREA_PAGES + 31u) / 32u)
+ #define SM_VA_GUARD_OFF   0x400000ull	/* area + 4 MiB: never allocated */
+-#define SM_TABLE_POOL_PAGES 16u	/* PMD/PTE pages for the area */
++/*
++ * PMD/PTE pages for the area.  One PTE page covers 2 MiB of VA, so covering
++ * the whole 256 MiB area takes 128 of them, plus the one PMD page the area
++ * hangs off.  It was 16 (about 30 MiB of VA) until the F3 bring-up: Mesa's
++ * panfrost asks for a 128 MiB tiler heap BO, and mapping that has to succeed
++ * while the pool is the only source of PTE pages.
++ */
++#define SM_TABLE_POOL_PAGES 129u
+ #define SM_TABLES_TOTAL_PAGES (SM_TABLES_PAGES + SM_TABLE_POOL_PAGES)
+ /*
+  * D2: a client owns handles, not slots, so the table is sized for a working
+@@ -453,6 +467,11 @@
+  */
+ struct sm_bo {
+ 	vm_offset_t kva;
++	/*
++	 * The physical address of the allocation.  Meaningful only while
++	 * `scattered` is FALSE: a scattered BO is one VA range over pages that
++	 * are not adjacent in physical memory, so it has no single PA.
++	 */
+ 	uint64_t pa;
+ 	uint64_t size;
+ 	uint64_t gpu_va;
+@@ -460,6 +479,15 @@
+ 	/* D3: set while a SUBMIT naming this BO is inside the core. */
+ 	boolean_t busy;
+ 	/*
++	 * F3: TRUE when sm_alloc_contig() failed and the BO fell back to a
++	 * kmem_alloc() buffer, mapped into the GPU with one 4 KiB PTE per page.
++	 * Such a BO cannot be handed to IOKit as a single physical range, so
++	 * sm_bo_info() refuses it: a client mmap of a scattered BO is not
++	 * supported, and the BOs that need one (shader code, vertex buffers,
++	 * framebuffers) are small enough to stay contiguous.
++	 */
++	boolean_t scattered;
++	/*
+ 	 * F1/B2: the SweetMaliUserClient that created this BO, or NULL for the
+ 	 * kernel probe suite.  clientClose() only closes matching BOs, so the
+ 	 * first real userspace client cannot lose its memory when the probe
+@@ -1647,6 +1675,53 @@
+ }
+ 
+ /*
++ * F3: the same mapping for a buffer that is only *virtually* contiguous.
++ *
++ * A BO whose contiguous allocation failed comes from kmem_alloc() instead,
++ * which hands back a wired kernel VA whose pages are wherever the VM put
++ * them.  The GPU has no way to see that: every page is mapped separately, at
++ * the same 4 KiB granularity sm_va_map_4k() uses, so the hardware still walks
++ * one contiguous VA range and the rest of the driver (SUBMIT, cache
++ * maintenance, the descriptor page) never learns the difference.  The cost is
++ * one ml_vtophys() per page, which is a page-table walk apiece -- 32768 of
++ * them for panfrost's 128 MiB tiler heap.
++ */
++static int
++sm_va_map_4k_scattered(uint64_t va, uint64_t kva, uint64_t size)
++{
++	uint64_t aligned = va & ~(SM_GPU_PAGE_SIZE - 1ull);
++	uint64_t pages = (size + SM_GPU_PAGE_SIZE - 1ull) / SM_GPU_PAGE_SIZE;
++
++	if (!aligned || ((aligned >> 39) & 0x1ffull) ||
++	    ((aligned >> 30) & 0x1ffull) != SM_VA_AREA_PUD_INDEX ||
++	    ((aligned + size - 1ull) >> 30 & 0x1ffull) !=
++	    SM_VA_AREA_PUD_INDEX) {
++		return -1;
++	}
++	sm_pt_select(0);
++	sm_pt_tables[0] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	for (uint64_t i = 0; i < pages; i++) {
++		uint64_t v = aligned + i * SM_GPU_PAGE_SIZE;
++		uint32_t pmd_index = (uint32_t)((v >> 21) & 0x1ffull);
++		uint32_t pte_index = (uint32_t)((v >> 12) & 0x1ffull);
++		uint64_t pa = (uint64_t)ml_vtophys(kva + i * SM_GPU_PAGE_SIZE);
++		uint64_t *pte;
++
++		if (pa == 0) {
++			return -3;
++		}
++		pte = sm_area_pte_page(pmd_index);
++		if (!pte) {
++			return -2;
++		}
++		pte[pte_index] = sm_page_desc(pa);
++	}
++	sm_cache_clean_invalidate(sm.tables,
++	    SM_TABLES_TOTAL_PAGES * SM_GPU_PAGE_SIZE);
++	return sm_as_flush_pt(0, aligned, pages * SM_GPU_PAGE_SIZE);
++}
++
++/*
+  * Clear the leaf entries of a mapping.  The table pages stay in the pool --
+  * a driver reclaims empty tables lazily -- but the FLUSH_PT is what makes
+  * the unmap visible, exactly as in sm_pte4k_set().
+@@ -1691,10 +1766,25 @@
+ #pragma clang diagnostic pop
+ }
+ 
++/* F3: the kmem_alloc() half of the pair above (see sm_va_map_4k_scattered). */
++static void
++sm_bo_free_pages(vm_offset_t kva, uint64_t size)
++{
++	kmem_free(kernel_map, kva, (vm_size_t)size);
++}
++
+ /*
+- * Open a BO in `slot`: one contiguous physical allocation plus a VA the
+- * allocator picks and maps.  Idempotent, so a case can name an existing BO
+- * (that is how "the same VA works again later" is stated).
++ * Open a BO in `slot`: one allocation plus a VA the allocator picks and maps.
++ * Idempotent, so a case can name an existing BO (that is how "the same VA
++ * works again later" is stated).
++ *
++ * The allocation is one physically contiguous block when the VM can find one.
++ * It often cannot: Mesa's panfrost opens with a 128 MiB tiler heap, and after
++ * a boot has fragmented DRAM even 32 MiB fails (measured: 8 MiB succeeds,
++ * 32 MiB returns an error).  When the contiguous allocation fails the BO
++ * falls back to kmem_alloc() -- virtually contiguous, physically scattered --
++ * and is mapped page by page, which the GPU cannot tell from a contiguous
++ * one.  Small BOs keep taking the first branch.
+  */
+ static int
+ sm_bo_open(uint32_t slot, uint64_t size)
+@@ -1704,6 +1794,7 @@
+ 	uint64_t pa = 0;
+ 	uint64_t va;
+ 	vm_offset_t kva;
++	boolean_t scattered = FALSE;
+ 
+ 	if (slot >= SM_BO_MAX) {
+ 		return -1;
+@@ -1713,20 +1804,34 @@
+ 	}
+ 	kva = sm_alloc_contig((vm_size_t)size, SM_GPU_PAGE_SIZE, &pa);
+ 	if (!kva) {
+-		return -2;
++		if (kmem_alloc(kernel_map, &kva, (vm_size_t)size,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return -2;
++		}
++		scattered = TRUE;
+ 	}
+ 	va = sm_va_alloc(pages);
+ 	if (!va) {
+-		sm_bo_free_mem(kva, size);
++		if (scattered) {
++			sm_bo_free_pages(kva, size);
++		} else {
++			sm_bo_free_mem(kva, size);
++		}
+ 		return -3;
+ 	}
+-	if (sm_va_map_4k(va, pa, size)) {
++	if (scattered ? sm_va_map_4k_scattered(va, kva, size) :
++	    sm_va_map_4k(va, pa, size)) {
+ 		sm_va_free(va, pages);
+-		sm_bo_free_mem(kva, size);
++		if (scattered) {
++			sm_bo_free_pages(kva, size);
++		} else {
++			sm_bo_free_mem(kva, size);
++		}
+ 		return -4;
+ 	}
+ 	sm.bo[slot].kva = kva;
+ 	sm.bo[slot].pa = pa;
++	sm.bo[slot].scattered = scattered;
+ 	sm.bo[slot].size = size;
+ 	sm.bo[slot].gpu_va = va;
+ 	sm.bo[slot].used = TRUE;
+@@ -1762,9 +1867,14 @@
+ 		 * next open of this slot overwrites it.
+ 		 */
+ 	}
+-	sm_bo_free_mem(bo->kva, bo->size);
++	if (bo->scattered) {
++		sm_bo_free_pages(bo->kva, bo->size);
++	} else {
++		sm_bo_free_mem(bo->kva, bo->size);
++	}
+ 	bo->kva = 0;
+ 	bo->pa = 0;
++	bo->scattered = FALSE;
+ 	bo->used = FALSE;
+ 	bo->busy = FALSE;
+ 	bo->owner = NULL;
+@@ -1895,6 +2005,17 @@
+ 	    sm.bo[handle].owner != owner || pa == NULL || size == NULL) {
+ 		return -1;
+ 	}
++	/*
++	 * A scattered BO has no single physical range to describe, so it cannot
++	 * be mapped into a client task.  Nothing asks for this today: the only
++	 * BOs the driver scatters are ones too large to be contiguous, and the
++	 * one panfrost opens that way (the tiler heap) is PAN_BO_INVISIBLE.
++	 */
++	if (sm.bo[handle].scattered) {
++		printf("SWEETMALI: BO %u is scattered, cannot map it to a "
++		    "client\n", handle);
++		return -2;
++	}
+ 	*pa = sm.bo[handle].pa;
+ 	*size = sm.bo[handle].size;
+ 	return 0;
