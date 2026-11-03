@@ -1,0 +1,230 @@
+--- a/bsd/dev/sweet_f1_install.c
++++ b/bsd/dev/sweet_f1_install.c
+@@ -9,9 +9,9 @@
+  *   sweetf1=0x<phys>,0x<size>
+  * on the kernel command line.  The shim copies every payload segment to its
+  * physical address (the blob lands page-aligned), and this file reads it back
+- * through ml_io_map() and writes the files with the kernel's own journaled
+- * HFS+ path.  It runs from bsd_init() after the root vnode exists and before
+- * load_init_program(), so the LaunchDaemon plist is in place when launchd
++ * through ml_io_map_unmappable() and writes the files with the kernel's own
++ * journaled HFS+ path.  It runs from bsd_init() after the root vnode exists
++ * and before load_init_program(), so the LaunchDaemon plist is in place when launchd
+  * scans /System/Library/LaunchDaemons.
+  *
+  * Blob format (little endian, all offsets from the blob start):
+@@ -45,6 +45,7 @@
+ #include <libkern/libkern.h>
+ #include <vm/vm_kern.h>
+ #include <vm/vm_map.h>
++#include <vm/pmap.h>
+ #include <stdint.h>
+ 
+ #define F1_BLOB_MAGIC0          'S'
+@@ -52,16 +53,25 @@
+ #define F1_BLOB_MAGIC2          'F'
+ #define F1_BLOB_MAGIC3          '1'
+ #define F1_BLOB_VERSION         1u
+-#define F1_MAX_BLOB             (4u * 1024u * 1024u)
++/* SweetMali: raised from 4 MiB for the Mesa/OSMesa dylib (F3).  The blob is
++ * mapped whole but only ever touched with byte loads, and every file is
++ * streamed out through one F1_CHUNK Normal-memory buffer, so a 32 MiB blob
++ * costs 32 MiB of kernel VA and no blob-sized wired allocation. */
++#define F1_MAX_BLOB             (32u * 1024u * 1024u)
+ #define F1_MAX_ENTRIES          8u
+ #define F1_HEADER_SIZE          12u
+ #define F1_ENTRY_HEADER_SIZE    12u
+ #define F1_MAX_PATH             128u
++/* Device-memory copy chunk; the blob itself is never copied to Normal RAM */
++#define F1_CHUNK                (128u * 1024u)
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* Not visible to bsd/ through <machine/machine_routines.h> (MACH_KERNEL_PRIVATE) */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size,
++    uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+ 
+ static uint32_t
+-f1_le32(const uint8_t *p)
++f1_le32(const volatile uint8_t *p)
+ {
+ 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+ 	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+@@ -131,10 +141,13 @@
+  */
+ static void
+ f1_write_file(vfs_context_t ctx, const char *path, uint32_t mode,
+-    const uint8_t *data, uint32_t len)
++    const volatile uint8_t *data, uint32_t len)
+ {
++	vm_offset_t kbuf = 0;
+ 	vnode_t vp = NULLVP;
+-	int resid = 0;
++	uint8_t *buf;
++	kern_return_t kr;
++	uint32_t done = 0;
+ 	errno_t err;
+ 
+ 	if (path[0] != '/') {
+@@ -147,17 +160,47 @@
+ 		printf("SWEET F1: open %s failed err=%d\n", path, err);
+ 		return;
+ 	}
+-	err = vn_rdwr(UIO_WRITE, vp, (caddr_t)data, (int)len, 0,
+-	    UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &resid,
+-	    vfs_context_proc(ctx));
+-	vnode_close(vp, FWRITE, ctx);
+-	if (err != 0 || resid != 0) {
+-		printf("SWEET F1: write %s failed err=%d resid=%d\n", path,
+-		    err, resid);
++	/*
++	 * The blob lives in Device memory, where an unaligned 8-byte load is a
++	 * kernel data abort, so every file is streamed through this small
++	 * Normal-memory chunk instead of being copied whole into a second
++	 * blob-sized buffer.
++	 */
++	kr = kmem_alloc(kernel_map, &kbuf, F1_CHUNK, KMA_DATA,
++	    VM_KERN_MEMORY_BSD);
++	if (kr != KERN_SUCCESS) {
++		printf("SWEET F1: chunk alloc failed kr=%d\n", kr);
++		vnode_close(vp, FWRITE, ctx);
+ 		return;
+ 	}
+-	printf("SWEET F1: wrote %s (%u bytes, mode %o)\n", path, len,
+-	    (unsigned)(mode & 0777u));
++	buf = (uint8_t *)kbuf;
++	while (done < len) {
++		uint32_t n = len - done;
++		uint32_t i;
++		int resid = 0;
++
++		if (n > F1_CHUNK) {
++			n = F1_CHUNK;
++		}
++		for (i = 0; i < n; i++) {
++			buf[i] = data[done + i];
++		}
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)buf, (int)n,
++		    (off_t)done, UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx),
++		    &resid, vfs_context_proc(ctx));
++		if (err != 0 || resid != 0) {
++			printf("SWEET F1: write %s off=%u failed err=%d resid=%d\n",
++			    path, done, err, resid);
++			break;
++		}
++		done += n;
++	}
++	kmem_free(kernel_map, kbuf, F1_CHUNK);
++	vnode_close(vp, FWRITE, ctx);
++	if (done == len) {
++		printf("SWEET F1: wrote %s (%u bytes, mode %o)\n", path, len,
++		    (unsigned)(mode & 0777u));
++	}
+ }
+ 
+ void
+@@ -166,13 +209,11 @@
+ 	char arg[128];
+ 	char path[F1_MAX_PATH];
+ 	char magic[4];
+-	const uint8_t *blob;
+-	const uint8_t *cur;
+-	const uint8_t *end;
++	const volatile uint8_t *blob;
++	const volatile uint8_t *cur;
++	const volatile uint8_t *end;
+ 	vm_offset_t map;
+-	vm_offset_t kbuf = 0;
+-	vm_size_t off;
+-	kern_return_t kr;
++	vm_size_t map_off, map_len;
+ 	uint64_t pa, size;
+ 	uint32_t version, count, i;
+ 	vfs_context_t ctx;
+@@ -185,36 +226,36 @@
+ 		printf("SWEET F1: bad sweetf1 arg '%s'\n", arg);
+ 		return;
+ 	}
+-	map = ml_io_map((vm_offset_t)pa, (vm_size_t)size);
++	/*
++	 * The blob is Device memory and is larger than the kernel's 8 MiB
++	 * io_submap, so it must not go through ml_io_map(): that one allocates a
++	 * KMA_NOFAIL entry from io_submap and panics with KERN_NO_SPACE for
++	 * anything that does not fit.  ml_io_map_unmappable() takes the VA from
++	 * kernel_map instead, and ml_io_unmap() returns it to kernel_map.
++	 */
++	map_off = (vm_size_t)(pa & PAGE_MASK);
++	map_len = (vm_size_t)round_page((uint64_t)size + (uint64_t)map_off);
++	map = ml_io_map_unmappable((vm_offset_t)(pa - map_off), map_len,
++	    VM_WIMG_IO);
+ 	if (map == 0) {
+ 		printf("SWEET F1: map failed pa=0x%llx size=0x%llx\n",
+ 		    (unsigned long long)pa, (unsigned long long)size);
+ 		return;
+ 	}
+ 	/*
+-	 * ml_io_map() maps the blob as Device memory (VM_WIMG_IO).  The
+-	 * parsers below use byte loads, but memcpy(), memcmp() and the HFS+
+-	 * write path may use 8-byte loads; an unaligned Device access is a
+-	 * kernel data abort.  Copy the blob byte-wise into Normal memory and
+-	 * parse/write from there.
++	 * The mapping is Device memory (VM_WIMG_IO): the blob pointers below are
++	 * volatile so the compiler cannot widen the byte loads into 16-byte
++	 * vector loads (an unaligned Device access is a kernel data abort), and
++	 * f1_write_file() streams each file out through a small Normal-memory
++	 * chunk.
+ 	 */
+-	kr = kmem_alloc(kernel_map, &kbuf, (vm_size_t)size, KMA_DATA,
+-	    VM_KERN_MEMORY_BSD);
+-	if (kr != KERN_SUCCESS) {
+-		printf("SWEET F1: alloc failed size=0x%llx kr=%d\n",
+-		    (unsigned long long)size, kr);
+-		return;
+-	}
+-	for (off = 0; off < (vm_size_t)size; off++) {
+-		((volatile uint8_t *)kbuf)[off] =
+-		    ((const volatile uint8_t *)map)[off];
+-	}
+-	blob = (const uint8_t *)kbuf;
++	blob = (const volatile uint8_t *)(map + map_off);
+ 	magic[0] = F1_BLOB_MAGIC0;
+ 	magic[1] = F1_BLOB_MAGIC1;
+ 	magic[2] = F1_BLOB_MAGIC2;
+ 	magic[3] = F1_BLOB_MAGIC3;
+-	if (memcmp(blob, magic, sizeof(magic)) != 0) {
++	if (blob[0] != magic[0] || blob[1] != magic[1] ||
++	    blob[2] != magic[2] || blob[3] != magic[3]) {
+ 		printf("SWEET F1: bad blob magic\n");
+ 		goto done;
+ 	}
+@@ -230,7 +271,7 @@
+ 	cur = blob + F1_HEADER_SIZE;
+ 	end = blob + size;
+ 	for (i = 0; i < count; i++) {
+-		uint32_t path_len, mode, data_len;
++		uint32_t path_len, mode, data_len, j;
+ 
+ 		if ((size_t)(end - cur) < F1_ENTRY_HEADER_SIZE) {
+ 			printf("SWEET F1: entry %u truncated\n", i);
+@@ -246,16 +287,18 @@
+ 			printf("SWEET F1: entry %u bad sizes\n", i);
+ 			goto done;
+ 		}
+-		memcpy(path, cur, path_len);
++		for (j = 0; j < path_len; j++) {
++			path[j] = (char)cur[j];
++		}
+ 		path[path_len] = '\0';
+ 		cur += path_len;
+ 		f1_write_file(ctx, path, mode, cur, data_len);
+ 		cur += data_len;
+-		cur = (const uint8_t *)(((uintptr_t)cur + 3u) &
++		cur = (const volatile uint8_t *)(((uintptr_t)cur + 3u) &
+ 		    ~(uintptr_t)3u);
+ 	}
+ 	printf("SWEET F1: install complete (%u files)\n", count);
+ 
+ done:
+-	kmem_free(kernel_map, kbuf, (vm_size_t)size);
++	ml_io_unmap(map, map_len);
+ }
