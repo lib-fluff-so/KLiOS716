@@ -1,0 +1,226 @@
+diff --git a/src/gallium/frontends/osmesa/osmesa.c b/src/gallium/frontends/osmesa/osmesa.c
+index 6d61677..1ab70f4 100644
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -615,7 +615,8 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+       case OSMESA_PROFILE:
+          profile = attribList[i+1];
+          if (profile != OSMESA_CORE_PROFILE &&
+-             profile != OSMESA_COMPAT_PROFILE)
++             profile != OSMESA_COMPAT_PROFILE &&
++             profile != 0x36 /* SweetMali: OpenGL ES */)
+             return NULL;
+          break;
+       case OSMESA_CONTEXT_MAJOR_VERSION:
+@@ -664,6 +665,8 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+    memset(&attribs, 0, sizeof(attribs));
+    attribs.profile = (profile == OSMESA_CORE_PROFILE)
+       ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   if (profile == 0x36) /* SweetMali: GLES, major 1 = ES1, else ES2/ES3 */
++      attribs.profile = (version_major == 1) ? API_OPENGLES : API_OPENGLES2;
+    attribs.major = version_major;
+    attribs.minor = version_minor;
+    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */
+diff --git a/src/gallium/targets/osmesa/meson.build b/src/gallium/targets/osmesa/meson.build
+index 3c37161..8e29ab1 100644
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -15,6 +15,13 @@ if with_ld_version_script
+   osmesa_link_deps += files('osmesa.sym')
+ endif
+ 
++osmesa_sweet_files = []
++osmesa_sweet_deps = []
++if with_gallium_panfrost and host_machine.system() == 'darwin'
++  osmesa_sweet_files += 'sweet_hw.c'
++  osmesa_sweet_deps += [driver_panfrost, dep_libdrm]
++endif
++
+ osmesa_def = custom_target(
+   'osmesa.def',
+   input: 'osmesa.def.in',
+@@ -24,7 +31,7 @@ osmesa_def = custom_target(
+ 
+ libosmesa = shared_library(
+   osmesa_lib_name,
+-  'osmesa_target.c',
++  ['osmesa_target.c', osmesa_sweet_files],
+   gnu_symbol_visibility : 'hidden',
+   link_args : [ld_args_gc_sections, osmesa_link_args],
+   vs_module_defs : osmesa_def,
+@@ -39,6 +46,7 @@ libosmesa = shared_library(
+   ],
+   dependencies : [
+     dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
++    osmesa_sweet_deps,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+diff --git a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+index 25985dd..d1ee090 100644
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -30,6 +30,9 @@
+ struct pipe_screen *
+ osmesa_create_screen(void);
+ 
++/* SweetMali: hardware path (targets/osmesa/sweet_hw.c) */
++struct pipe_screen *sweet_hw_create_screen(void) __attribute__((weak));
++
+ 
+ struct pipe_screen *
+ osmesa_create_screen(void)
+@@ -37,6 +40,11 @@ osmesa_create_screen(void)
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
++   /* SweetMali: gallium panfrost when the SweetMali device is there */
++   screen = sweet_hw_create_screen ? sweet_hw_create_screen() : NULL;
++   if (screen)
++      return debug_screen_wrap(screen);
++
+    /* We use a null software winsys since we always just render to ordinary
+     * driver resources.
+     */
+diff --git a/src/gallium/targets/osmesa/sweet_hw.c b/src/gallium/targets/osmesa/sweet_hw.c
+new file mode 100644
+index 0000000..3298a3d
+--- /dev/null
++++ b/src/gallium/targets/osmesa/sweet_hw.c
+@@ -0,0 +1,86 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * sweet_hw.c: the hardware (gallium panfrost / Mali-G57) pipe_screen of Mesa's
++ * OSMesa target on KL7 (MT6789, iOS 16, no DRM).
++ *
++ * osmesa_create_screen() in osmesa_target.c asks this file first and only
++ * falls back to softpipe when it returns NULL:
++ *
++ *   SWEET_GPU unset or != 0   gallium panfrost over the SweetMali libdrm stand-in
++ *   SWEET_GPU=0               force softpipe (the pre-F2 behaviour)
++ *
++ * The "device" is a file descriptor of the libdrm stand-in (gpu/mali-sweet):
++ * every DRM_IOCTL_PANFROST_* it forwards is a selector of the SweetMali user
++ * client, and the BO "mmap offsets" it hands out are IOKit memory types.
++ * Mesa's os_mmap() is routed to sweet_drm_mmap() (0003-os-mman-sweet.patch),
++ * so mapping a BO calls IOConnectMapMemory64() and never the real mmap().
++ *
++ * Nothing here touches src/panfrost: the screen is created through panfrost's
++ * public winsys entry point, exactly the way an EGL/GBM target would.
++ */
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "util/macros.h"
++#include "util/xmlconfig.h"
++#include "util/driconf.h"
++#include "panfrost/drm/panfrost_drm_public.h"
++
++/* gpu/mali-sweet/sweet_drm.h -- the libdrm stand-in, headers not installed */
++extern int drmOpenWithType(const char *name, const char *busid, int type);
++#define SWEET_DRM_NODE_RENDER 2
++
++/* The dri options panfrost and the gallium core parse at screen creation. */
++static const driOptionDescription sweet_driconf[] = {
++#include "pipe-loader/driinfo_gallium.h"
++#include "panfrost/driinfo_panfrost.h"
++};
++
++static struct pipe_screen *g_screen;
++
++struct pipe_screen *sweet_hw_create_screen(void);
++
++struct pipe_screen *
++sweet_hw_create_screen(void)
++{
++   static struct driOptionCache cache;
++   static struct driOptionCache info;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   const char *e = getenv("SWEET_GPU");
++   int fd;
++
++   if (g_screen != NULL)
++      return g_screen;
++   if (e != NULL && e[0] == '0')
++      return NULL;
++
++   fd = drmOpenWithType("panfrost", NULL, SWEET_DRM_NODE_RENDER);
++   if (fd < 0) {
++      fprintf(stderr, "OSMesa/sweet: no SweetMali device (drmOpen failed), using softpipe\n");
++      return NULL;
++   }
++
++   /* panfrost_create_screen() dereferences config; give it the real thing. */
++   driParseOptionInfo(&info, sweet_driconf, ARRAY_SIZE(sweet_driconf));
++   driParseConfigFiles(&cache, &info, 0, "panfrost", NULL, NULL, NULL, 0,
++                       NULL, 0);
++   config.options = &cache;
++   config.options_info = &info;
++
++   screen = panfrost_drm_screen_create(fd, &config);
++   if (screen == NULL) {
++      fprintf(stderr, "OSMesa/sweet: panfrost screen creation failed, using softpipe\n");
++      return NULL;
++   }
++   if (getenv("SWEET_GPU_DEBUG")) {
++      fprintf(stderr, "OSMesa/sweet: panfrost screen: %s / %s\n",
++              screen->get_name(screen), screen->get_vendor(screen));
++   }
++   g_screen = screen;
++   return screen;
++}
+diff --git a/src/util/os_mman.h b/src/util/os_mman.h
+index 1567ee7..0e53b30 100644
+--- a/src/util/os_mman.h
++++ b/src/util/os_mman.h
+@@ -51,7 +51,44 @@ extern "C" {
+ #endif
+ 
+ 
+-#if DETECT_OS_ANDROID && !defined(__LP64__)
++#if defined(__APPLE__)
++/*
++ * SweetMali (KL7): the panfrost "DRM device" is a libdrm stand-in over an
++ * IOKit user client (gpu/mali-sweet).  Its BO mappings are not real mmap()s,
++ * so every os_mmap()/os_munmap() is offered to the stand-in first; it falls
++ * back to the C library for fds and addresses it does not own.  The symbols
++ * are weak, so Mesa still links and runs without the stand-in (softpipe).
++ */
++#include <stdint.h>
++
++void *sweet_drm_mmap(int fd, size_t len, uint64_t offset)
++   __attribute__((weak));
++int sweet_drm_munmap(void *addr, size_t len) __attribute__((weak));
++
++static inline void *
++os_mmap_sweet(void *addr, size_t length, int prot, int flags, int fd,
++              off_t offset)
++{
++   if (sweet_drm_mmap)
++      return sweet_drm_mmap(fd, length, (uint64_t)offset);
++   return mmap(addr, length, prot, flags, fd, offset);
++}
++
++static inline int
++os_munmap_sweet(void *addr, size_t length)
++{
++   if (sweet_drm_munmap)
++      return sweet_drm_munmap(addr, length);
++   return munmap(addr, length);
++}
++
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             os_mmap_sweet(addr, length, prot, flags, fd, offset)
++
++#  define os_munmap(addr, length) \
++             os_munmap_sweet(addr, length)
++
++#elif DETECT_OS_ANDROID && !defined(__LP64__)
+ /* 32-bit needs mmap64 for 64-bit offsets */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+              mmap64(addr, length, prot, flags, fd, offset)
