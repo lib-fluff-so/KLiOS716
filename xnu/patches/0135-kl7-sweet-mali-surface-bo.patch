@@ -1,0 +1,1569 @@
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -488,6 +488,18 @@
+ 	 */
+ 	boolean_t scattered;
+ 	/*
++	 * E: TRUE when the pages behind this BO belong to someone else -- an
++	 * IOSurface's pixels, mapped in on the client's behalf.  Such a BO is
++	 * addressed and submitted like any other (SUBMIT cannot tell the
++	 * difference and must not), but closing it unmaps the VA and stops
++	 * there: the memory was never the driver's to free.  sm_bo_info()
++	 * refuses it too, because there is no single contiguous allocation to
++	 * describe to IOKit -- the client already has the surface mapped
++	 * through IOSurface, which is what makes the pixels readable without
++	 * another copy.
++	 */
++	boolean_t external;
++	/*
+ 	 * F1/B2: the SweetMaliUserClient that created this BO, or NULL for the
+ 	 * kernel probe suite.  clientClose() only closes matching BOs, so the
+ 	 * first real userspace client cannot lose its memory when the probe
+@@ -1722,6 +1734,55 @@
+ }
+ 
+ /*
++ * E: the same mapping again, for pages whose physical addresses are already
++ * known -- an IOSurface's.
++ *
++ * A surface's memory is wired kernel memory, but it is not one contiguous
++ * run: the IOKit layer walks it a segment at a time and fills `pas` with one
++ * address per 4 KiB page.  The loop below is sm_va_map_4k_scattered()'s with
++ * the walk replaced by an array lookup, for the same reason: the hardware
++ * still walks one contiguous VA range and nothing else in the driver learns
++ * the pages were scattered.
++ *
++ * The table clean and the FLUSH_PT happen once, after the last PTE.  Doing
++ * them per page would flush the whole table set for every 4 KiB of an 8 MiB
++ * surface -- 2048 flushes of the same megabyte.
++ */
++static int
++sm_va_map_4k_pages(uint64_t va, const uint64_t *pas, uint32_t page_count)
++{
++	uint64_t aligned = va & ~(SM_GPU_PAGE_SIZE - 1ull);
++	uint64_t size = (uint64_t)page_count * SM_GPU_PAGE_SIZE;
++
++	if (!aligned || page_count == 0 || pas == NULL ||
++	    ((aligned >> 39) & 0x1ffull) ||
++	    ((aligned >> 30) & 0x1ffull) != SM_VA_AREA_PUD_INDEX ||
++	    ((aligned + size - 1ull) >> 30 & 0x1ffull) != SM_VA_AREA_PUD_INDEX) {
++		return -1;
++	}
++	sm_pt_select(0);
++	sm_pt_tables[0] = sm_page_table_desc(sm_pt_base + SM_GPU_PAGE_SIZE);
++	for (uint32_t i = 0; i < page_count; i++) {
++		uint64_t v = aligned + (uint64_t)i * SM_GPU_PAGE_SIZE;
++		uint32_t pmd_index = (uint32_t)((v >> 21) & 0x1ffull);
++		uint32_t pte_index = (uint32_t)((v >> 12) & 0x1ffull);
++		uint64_t *pte;
++
++		if (pas[i] == 0 || (pas[i] & (SM_GPU_PAGE_SIZE - 1ull)) != 0) {
++			return -3;
++		}
++		pte = sm_area_pte_page(pmd_index);
++		if (!pte) {
++			return -2;
++		}
++		pte[pte_index] = sm_page_desc(pas[i]);
++	}
++	sm_cache_clean_invalidate(sm.tables,
++	    SM_TABLES_TOTAL_PAGES * SM_GPU_PAGE_SIZE);
++	return sm_as_flush_pt(0, aligned, size);
++}
++
++/*
+  * Clear the leaf entries of a mapping.  The table pages stay in the pool --
+  * a driver reclaims empty tables lazily -- but the FLUSH_PT is what makes
+  * the unmap visible, exactly as in sm_pte4k_set().
+@@ -1907,7 +1968,14 @@
+ 		 * next open of this slot overwrites it.
+ 		 */
+ 	}
+-	if (bo->scattered) {
++	if (bo->external) {
++		/*
++		 * E: these pages belong to a surface, not to us.  The VA goes
++		 * back and the PTEs are gone, but there is nothing to free --
++		 * the IOKit layer forgot its hold on the surface when it saw
++		 * this close succeed.
++		 */
++	} else if (bo->scattered) {
+ 		sm_bo_free_pages(bo->kva, bo->size);
+ 	} else {
+ 		sm_bo_free_mem(bo->kva, bo->size);
+@@ -1915,6 +1983,7 @@
+ 	bo->kva = 0;
+ 	bo->pa = 0;
+ 	bo->scattered = FALSE;
++	bo->external = FALSE;
+ 	bo->used = FALSE;
+ 	bo->busy = FALSE;
+ 	bo->owner = NULL;
+@@ -1980,6 +2049,66 @@
+ 	return 0;
+ }
+ 
++/*
++ * E: a BO whose pages are not the driver's -- an IOSurface's pixels.
++ *
++ * `pas` holds one physical address per 4 KiB page of a surface the IOKit layer
++ * has already looked up, checked and is holding a reference to.  The VA and
++ * the handle are allocated here, so from SUBMIT's side the result is an
++ * ordinary BO with an ordinary address; that a BO can be addressed without
++ * being owned is the whole point of the stage.  Two things differ, and both
++ * are deliberate: the slot is marked external so sm_bo_close() unmaps without
++ * freeing memory it never allocated, and the owner is the client, so
++ * clientClose() takes the handle away with the rest of its BOs.
++ */
++int
++sm_bo_create_external(uint64_t size, uint64_t kva, const uint64_t *pas,
++    uint32_t page_count, void *owner, uint32_t *handle)
++{
++	uint32_t slot;
++	uint64_t va;
++
++	if (handle == NULL || size == 0 || pas == NULL ||
++	    (size & (uint64_t)(SM_GPU_PAGE_SIZE - 1u)) != 0 ||
++	    page_count != (uint32_t)(size / SM_GPU_PAGE_SIZE) ||
++	    size > SM_VA_AREA_SIZE || !sm.ready) {
++		return -1;
++	}
++	for (slot = 0; slot < SM_BO_MAX; slot++) {
++		if (!sm.bo[slot].used) {
++			break;
++		}
++	}
++	if (slot == SM_BO_MAX) {
++		return -2;
++	}
++	va = sm_va_alloc(page_count);
++	if (!va) {
++		return -3;
++	}
++	if (sm_va_map_4k_pages(va, pas, page_count)) {
++		sm_va_free(va, page_count);
++		return -4;
++	}
++	/*
++	 * The kernel address is the surface's own, not an allocation of ours.
++	 * Keeping it here is what lets SYNC_BO and the self-test's readback
++	 * work on an external BO without a second code path: they only ever
++	 * need *an* address, and the close will not free this one.
++	 */
++	sm.bo[slot].kva = (vm_offset_t)kva;
++	sm.bo[slot].pa = 0;
++	sm.bo[slot].scattered = FALSE;
++	sm.bo[slot].external = TRUE;
++	sm.bo[slot].size = size;
++	sm.bo[slot].gpu_va = va;
++	sm.bo[slot].used = TRUE;
++	sm.bo[slot].busy = FALSE;
++	sm.bo[slot].owner = owner;
++	*handle = slot;
++	return 0;
++}
++
+ int
+ sm_bo_destroy(uint32_t handle, void *owner)
+ {
+@@ -1991,6 +2120,7 @@
+ 	return 0;
+ }
+ 
++
+ int
+ sm_bo_present(uint32_t handle)
+ {
+@@ -1998,6 +2128,20 @@
+ }
+ 
+ /*
++ * E: ownership alone, without the physical range sm_bo_info() reports.  A
++ * client that wants to sync a BO's cache does not care whether it has a
++ * single contiguous allocation, and by stage E one kind of BO -- a surface's
++ * -- has none; sm_bo_info() refuses those on purpose, so asking it here would
++ * turn "I cannot map this to you" into "you may not flush it".
++ */
++int
++sm_bo_owned(uint32_t handle, void *owner)
++{
++	return (handle < SM_BO_MAX && sm.bo[handle].used &&
++	    sm.bo[handle].owner == owner) ? 1 : 0;
++}
++
++/*
+  * The user client calls this from clientClose().  F1/B2 made two clients
+  * possible, so "all" means every BO with this owner and nothing else: the
+  * kernel probe suite's BOs (owner NULL) survive a userspace client exiting,
+@@ -2051,9 +2195,9 @@
+ 	 * BOs the driver scatters are ones too large to be contiguous, and the
+ 	 * one panfrost opens that way (the tiler heap) is PAN_BO_INVISIBLE.
+ 	 */
+-	if (sm.bo[handle].scattered) {
+-		printf("SWEETMALI: BO %u is scattered, cannot map it to a "
+-		    "client\n", handle);
++	if (sm.bo[handle].scattered || sm.bo[handle].external) {
++		printf("SWEETMALI: BO %u has no single physical range, cannot "
++		    "map it to a client\n", handle);
+ 		return -2;
+ 	}
+ 	*pa = sm.bo[handle].pa;
+--- a/bsd/sys/sweet_mali.h
++++ b/bsd/sys/sweet_mali.h
+@@ -77,8 +77,22 @@
+  * client closed -- which is exactly the first thing B2 makes possible.
+  */
+ int sm_bo_create(uint64_t size, void *owner, uint32_t *handle);
++
++/*
++ * E: a BO over pages somebody else owns -- an IOSurface's pixels.  `pas`
++ * holds one physical address per 4 KiB page, which the IOKit layer gets by
++ * walking the surface's IOMemoryDescriptor, and `kva` is the surface's own
++ * kernel address (the same pages, seen from the kernel) so SYNC_BO needs no
++ * second code path.  The surface is held alive by the IOKit layer for as long
++ * as the handle exists.  The resulting BO is submitted like any other;
++ * closing it unmaps the VA and frees nothing.
++ */
++int sm_bo_create_external(uint64_t size, uint64_t kva, const uint64_t *pas,
++    uint32_t page_count, void *owner, uint32_t *handle);
++
+ int sm_bo_destroy(uint32_t handle, void *owner);
+ int sm_bo_present(uint32_t handle);
++int sm_bo_owned(uint32_t handle, void *owner);
+ int sm_bo_info(uint32_t handle, void *owner, uint64_t *pa, uint64_t *size);
+ void sm_bo_close_all(void *owner);
+ 
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -54,10 +54,14 @@
+  *    kernel's own user-client self-test says which slot its jobs want too:
+  *    they are the panel demo's fragment-class write-value job, so it asks for
+  *    JS0, and its "the job completed" checks keep reading JS0's bit.
++ * 5: E adds SM_SEL_SURFACE_BO and struct sm_surface_bo: an IOSurface's pages
++ *    as a BO, so a render target can be the surface the compositor is going
++ *    to scan out.  Nothing existing changes: a client that does not call the
++ *    new selector cannot tell the version moved.
+  * F1/B2 added only selectors and new structs; no existing layout changed
+  * there, which is why it did not move this number.
+  */
+-#define SM_ABI_VERSION          4u
++#define SM_ABI_VERSION          5u
+ 
+ /*
+  * Selectors.  The first block mirrors DRM_IOCTL_PANFROST_*; the second is
+@@ -79,6 +83,8 @@
+ /* Added by stage F1/B2: client mapping and a kernel-log readback channel. */
+ #define SM_SEL_MMAP_BO          0x0bu   /* in/out: struct sm_mmap_bo */
+ #define SM_SEL_LOG              0x0cu   /* in/out: struct sm_log */
++/* Added by stage E: an IOSurface's pages as a BO the GPU renders into. */
++#define SM_SEL_SURFACE_BO       0x0du   /* in/out: struct sm_surface_bo */
+ 
+ /*
+  * F3: the create flags, in the ABI's own spelling.  Mesa's panfrost opens its
+@@ -376,4 +382,49 @@
+ 	char text[SM_LOG_MAX];  /* in: NUL not required */
+ };
+ 
++/*
++ * E: an IOSurface's pixels as a BO.
++ *
++ * The pages behind `surface_id` (what IOSurfaceGetID() returns) are entered
++ * into the GPU address space, and the handle that comes back can be named by
++ * SM_SEL_SUBMIT exactly like a BO's.  Nothing is copied: the GPU writes the
++ * same physical pages the CPU sees through its own IOSurface mapping, which
++ * is the point -- a render target is then the surface the compositor is going
++ * to scan out, not a private buffer that has to be copied there afterwards.
++ *
++ * `surface_id` must name a surface the kernel knows AND that is backed by
++ * kernel-owned memory.  A surface wrapping client memory is refused: those
++ * pages are pageable and can move out from under the GPU.
++ *
++ * `handle` on input is SM_SURFACE_DESCRIBE_ONLY to ask only for the geometry
++ * (nothing is mapped, `handle` comes back 0); otherwise it must be 0 and the
++ * answer is a handle like CREATE_BO's.
++ *
++ * `offset` is where pixel (0, 0) sits inside the mapped range.  The mapping
++ * starts at the surface's own memory base -- the handle's GPU address is byte
++ * 0 of that range -- so a caller drawing at (x, y) writes to
++ * `gpu_va + offset + y * bytes_per_row + x * pixelsize`.
++ *
++ * The pages keep the surface's cache attributes, so the CPU/GPU handover goes
++ * through SM_SEL_SYNC_BO, as it does for any other BO.  Skipping it shows up
++ * as stale or torn pixels, not as an error.
++ *
++ * Closing the handle (SM_SEL_CLOSE_BO) unmaps the pages from the GPU address
++ * space and stops the kernel holding the surface; it never frees memory the
++ * kernel did not allocate.
++ */
++#define SM_SURFACE_DESCRIBE_ONLY 0xffffffffu
++struct sm_surface_bo {
++	uint32_t surface_id;    /* in: IOSurfaceGetID() */
++	uint32_t handle;        /* in: DESCRIBE_ONLY or 0; out: BO handle */
++	uint64_t size;          /* out: bytes mapped (whole pages) */
++	uint64_t gpu_va;        /* out: GPU address of the range's byte 0 */
++	uint32_t offset;        /* out: byte offset of pixel (0, 0) in the range */
++	uint32_t bytes_per_row; /* out */
++	uint32_t width;         /* out */
++	uint32_t height;        /* out */
++	uint32_t pixel_format;  /* out: the surface's, not the GPU's */
++	uint32_t planes;        /* out */
++};
++
+ #endif /* _BSD_DEV_SWEET_MALI_ABI_H_ */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -179,6 +179,14 @@
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++	/*
++	 * E: and it is the default surface, so a render target can be the panel
++	 * itself: SM_SEL_SURFACE_BO maps these pages into the GPU's address
++	 * space and the same memory is scanned out, with no copy in between.
++	 */
++	if (fSurface != NULL) {
++		sweet_surface_set_default(fSurface);
++	}
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -42,6 +42,8 @@
+ #include <string.h>		/* memset/memcpy in the argument plumbing */
+ 
+ #include <sys/sweet_mali.h>
++/* E: the IOSurface the client names by id, and the memory behind it. */
++#include "SweetSurface.h"
+ 
+ #define SM_LOG(fmt, ...)  IOLog("SWEETMALI UC: " fmt, ##__VA_ARGS__)
+ 
+@@ -172,6 +174,18 @@
+ 	 */
+ 	IOMemoryDescriptor *fBoMem[SM_BO_MAX];
+ 
++	/*
++	 * E: the surface behind each surface-backed BO, by handle, or NULL for
++	 * an ordinary BO.  This is the reference that keeps the pixels alive:
++	 * the GPU has PTEs pointing at them, so the memory must not be freed
++	 * while the handle exists, and the client that handed us the id is
++	 * free to drop its own IOSurface the moment the call returns.  It is
++	 * given up in CLOSE_BO, after the core has taken the PTEs away, and in
++	 * clientClose(), where sm_bo_close_all() has done the same for every
++	 * handle this client owned.
++	 */
++	SweetSurface *fSurface[SM_BO_MAX];
++
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID,
+ 	    uint32_t type) APPLE_KEXT_OVERRIDE;
+@@ -185,6 +199,16 @@
+ 
+ 	/* Called before the core frees a BO's pages; see its definition. */
+ 	void unmapAndForgetBo(uint32_t handle);
++
++	/*
++	 * E: the surface table.  `holdSurface` takes over a reference the
++	 * caller already holds (sweet_surface_copy()'s), so it never fails and
++	 * never retains; `surfaceForBo` answers NULL when the handle is not a
++	 * surface-backed one.
++	 */
++	void holdSurface(uint32_t handle, SweetSurface *surface);
++	SweetSurface *surfaceForBo(uint32_t handle);
++	void forgetSurface(uint32_t handle);
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetMaliUserClient, IOUserClient);
+@@ -198,6 +222,7 @@
+ 	}
+ 	fProvider = NULL;
+ 	memset(fBoMem, 0, sizeof(fBoMem));
++	memset(fSurface, 0, sizeof(fSurface));
+ 	return true;
+ }
+ 
+@@ -238,6 +263,47 @@
+ 	md->release();
+ }
+ 
++/*
++ * E: the surface table.
++ *
++ * A surface-backed BO is the first thing in this driver whose memory is not
++ * the driver's, and the reference rule that follows is the only subtle part
++ * of it: sweet_surface_copy() hands back a retained surface, the call that
++ * creates the BO moves that reference into the table here, and it is dropped
++ * when the handle closes.  Between those two points a PTE names the surface's
++ * pages, so the table is what makes it impossible for the client to free the
++ * memory out from under the GPU by releasing its IOSurface early.
++ */
++void
++SweetMaliUserClient::holdSurface(uint32_t handle, SweetSurface *surface)
++{
++	if (handle >= SM_BO_MAX || surface == NULL) {
++		return;
++	}
++	/*
++	 * The handle came from sm_bo_create_external(), which hands out free
++	 * slots, so the entry is NULL by construction.  Releasing anyway costs
++	 * nothing and turns a future change to the handle allocator into a leak
++	 * rather than into a stale reference to a surface nobody owns.
++	 */
++	OSSafeReleaseNULL(fSurface[handle]);
++	fSurface[handle] = surface;
++}
++
++SweetSurface *
++SweetMaliUserClient::surfaceForBo(uint32_t handle)
++{
++	return handle < SM_BO_MAX ? fSurface[handle] : NULL;
++}
++
++void
++SweetMaliUserClient::forgetSurface(uint32_t handle)
++{
++	if (handle < SM_BO_MAX) {
++		OSSafeReleaseNULL(fSurface[handle]);
++	}
++}
++
+ bool
+ SweetMaliUserClient::start(IOService *provider)
+ {
+@@ -278,6 +344,14 @@
+ 		unmapAndForgetBo(handle);
+ 	}
+ 	sm_bo_close_all(this);
++	/*
++	 * E: and the surfaces, now that no PTE names them: the core has
++	 * unmapped every one of this client's BOs above, so these references
++	 * are the last thing holding the pixels.
++	 */
++	for (handle = 0; handle < SM_BO_MAX; handle++) {
++		forgetSurface(handle);
++	}
+ 	sm_syncobj_close_all(this);
+ 	sm_client_lock_drop();
+ 	terminate();
+@@ -291,11 +365,18 @@
+  * exposed, then withPhysicalAddress describes the contiguous allocation for
+  * IOKit to map into the client task.  The BO is normal cacheable memory;
+  * SYNC_BO is what makes the CPU writes visible to the non-coherent GPU.
++ *
++ * E adds the one kind of BO whose window is not built here: a surface-backed
++ * BO's pages belong to an IOSurface, so the descriptor the surface already
++ * holds is what gets mapped, and the cache mode is the surface's (the panel's
++ * is write-combined).  Everything else about the path is the same, including
++ * the cache in fBoMem -- see the comment in the body for why that matters.
+  */
+ IOReturn
+ SweetMaliUserClient::clientMemoryForType(uint32_t type, IOOptionBits *options,
+     IOMemoryDescriptor **memory)
+ {
++	SweetSurface *surface;
+ 	uint64_t pa, size;
+ 	IOMemoryDescriptor *md;
+ 
+@@ -306,9 +387,35 @@
+ 	/*
+ 	 * The ownership check reads a BO table that another client's close may
+ 	 * be walking, and the descriptor cache below is shared with that close;
+-	 * hold the door's lock across both.
++	 * hold the door's lock across both.  The surface table is the client's
++	 * too and is written under the same lock.
+ 	 */
+ 	sm_client_lock_take();
++	surface = surfaceForBo(type);
++	if (surface != NULL && surface->memory != NULL) {
++		/*
++		 * A surface-backed handle answers with the surface's own
++		 * descriptor: the pages are the IOSurface's, and a mapping made
++		 * from this descriptor is the window the client reads what the
++		 * GPU drew through.  It is cached in fBoMem like any other --
++		 * the close path finds the descriptor to unmap by identity, and
++		 * a user mapping left alive after CLOSE_BO would keep the
++		 * surface's wired pages from ever being released.
++		 */
++		md = fBoMem[type];
++		if (md == NULL) {
++			md = surface->memory;
++			md->retain();
++			fBoMem[type] = md;
++		}
++		md->retain();
++		sm_client_lock_drop();
++		if (options != NULL) {
++			*options = surface->mapCache;
++		}
++		*memory = md;
++		return kIOReturnSuccess;
++	}
+ 	if (sm_bo_info(type, this, &pa, &size) != 0) {
+ 		sm_client_lock_drop();
+ 		return kIOReturnBadArgument;
+@@ -562,6 +669,14 @@
+ 	if (sm_bo_destroy(c.handle, client) != 0) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * E: the core has taken the PTEs away (sm_bo_close() unmaps before it
++	 * frees the slot, and for an external BO it frees nothing else), so
++	 * this is the first moment the surface behind the handle may be let go
++	 * of.  Ordering matters: releasing it earlier would leave the GPU
++	 * pointing at memory that is free to be reused.
++	 */
++	client->forgetSurface(c.handle);
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -676,12 +791,18 @@
+ sm_uc_sync_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_sync_bo s;
+-	uint64_t pa, size;
+ 
+ 	if (sm_uc_in(args, &s, sizeof(s)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sm_bo_info(s.handle, client, &pa, &size) != 0) {
++	/*
++	 * E: ownership only.  This used to call sm_bo_info(), which also
++	 * reports the BO's physical range -- and now refuses a surface-backed
++	 * BO, because there is no single allocation to describe to IOKit.  A
++	 * cache flush needs no physical address at all, so it asks the
++	 * question it actually has: is this handle yours?
++	 */
++	if (!sm_bo_owned(s.handle, client)) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	if (sm_bo_sync(s.handle, s.type, s.offset, s.size) != 0) {
+@@ -756,17 +877,21 @@
+  * MMAP_BO: validate that this connection owns the handle and return the
+  * offset the client passes to IOConnectMapMemory64() (or to mmap(2) through
+  * the libdrm stand-in).  The mapping itself is clientMemoryForType().
++ *
++ * E: ownership only.  This used to ask sm_bo_info(), which also reports the
++ * BO's physical range -- a surface-backed BO has none, and refusing to hand
++ * out the offset would mean a client could not map the very memory it is
++ * meant to read back from the GPU.
+  */
+ static IOReturn
+ sm_uc_mmap_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
+ {
+ 	struct sm_mmap_bo m;
+-	uint64_t pa, size;
+ 
+ 	if (sm_uc_in(args, &m, sizeof(m)) != kIOReturnSuccess) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sm_bo_info(m.handle, client, &pa, &size) != 0) {
++	if (!sm_bo_owned(m.handle, client)) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	m.offset = m.handle;
+@@ -805,6 +930,155 @@
+ 	return sm_uc_out(args, &l, sizeof(l));
+ }
+ 
++/*
++ * SURFACE_BO: an IOSurface's pixels as a BO (stage E).
++ *
++ * What comes back is an ordinary handle with an ordinary GPU address: the
++ * pages behind `surface_id` are entered into AS0 at a VA this allocates, and
++ * a SUBMIT that names the handle cannot tell it from a CREATE_BO one.  That
++ * is the whole point of the stage -- a render target can be the surface the
++ * compositor is going to scan out, with no copy afterwards and no second
++ * buffer to keep in step.
++ *
++ * Three things are refused, and each is a shape that cannot work rather than
++ * a case the port has:
++ *   - an id the kernel does not know (kIOReturnNotFound);
++ *   - a surface with no memory descriptor (kIOReturnUnsupported);
++ *   - memory that is not page-aligned, or has no kernel address
++ *     (kIOReturnUnsupported).  The GPU maps 4 KiB pages; a descriptor that
++ *     answers with a byte offset inside a page has no page to map.  Every
++ *     surface this kernel can hand out today comes from IOSurfaceRoot's
++ *     create(), which allocates a page-aligned kernel buffer, so this is
++ *     about keeping a future wrapped-or-partial surface from being mapped
++ *     wrongly instead of being refused.
++ *
++ * Walking the memory descriptor happens here rather than in the core: an
++ * IOMemoryDescriptor is IOKit's, and what the core takes is an array of
++ * physical addresses.  One getPhysicalSegment() per 4 KiB page is what the
++ * working reference implementation does, and it keeps this loop free of any
++ * assumption about how the descriptor is composed -- it may be one buffer or
++ * a scatter list, and the answer is the same.
++ *
++ * The surface's kernel address goes along as the BO's kernel mapping, so
++ * SYNC_BO and the probe suite's readback need no external-BO code path: they
++ * only ever wanted *an* address for those pages.  What the caller owes the
++ * driver around the handover is SYNC_BO: the pages are cacheable and the GPU
++ * is not coherent.
++ */
++static IOReturn
++sm_uc_surface_bo(SweetMaliUserClient *client, IOExternalMethodArguments *args)
++{
++	struct sm_surface_bo r;
++	SweetSurface *s;
++	uint64_t size, *pas = NULL, off;
++	uintptr_t kva;
++	uint32_t pages, n = 0, handle = 0;
++	int rc;
++
++	if (sm_uc_in(args, &r, sizeof(r)) != kIOReturnSuccess) {
++		return kIOReturnBadArgument;
++	}
++	if (r.handle != 0 && r.handle != SM_SURFACE_DESCRIBE_ONLY) {
++		return kIOReturnBadArgument;
++	}
++	if (!sm_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++	s = sweet_surface_copy(r.surface_id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (s->memory == NULL) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	/*
++	 * The geometry goes back on both paths: describing a surface is a
++	 * question about the surface, not about the GPU, and a caller that only
++	 * wants to know how big its render target is should not have to make a
++	 * BO to find out.
++	 */
++	size = ((uint64_t)s->memory->getLength() + SM_BO_PAGE_SIZE - 1) &
++	    ~(uint64_t)(SM_BO_PAGE_SIZE - 1);
++	r.size = size;
++	r.offset = s->offset;
++	r.bytes_per_row = s->bytesPerRow;
++	r.width = s->width;
++	r.height = s->height;
++	r.pixel_format = s->pixelFormat;
++	r.planes = s->planeCount;
++	r.gpu_va = 0;
++	if (r.handle == SM_SURFACE_DESCRIBE_ONLY) {
++		r.handle = 0;
++		s->release();
++		return sm_uc_out(args, &r, sizeof(r));
++	}
++	if (size == 0) {
++		s->release();
++		return kIOReturnBadArgument;
++	}
++	kva = s->kernelAddress();
++	if (kva == 0) {
++		SM_LOG("surface %u: no kernel address for %llu bytes\n",
++		    r.surface_id, (unsigned long long)size);
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	pages = (uint32_t)(size / SM_BO_PAGE_SIZE);
++	pas = (uint64_t *)IOMallocData(sizeof(uint64_t) * pages);
++	if (pas == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	for (off = 0; off < size; off += SM_BO_PAGE_SIZE) {
++		IOByteCount length = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &length,
++		    kIOMemoryMapperNone);
++
++		if (pa == 0 || length == 0 ||
++		    (pa & (SM_BO_PAGE_SIZE - 1)) != 0) {
++			SM_LOG("surface %u: page %u is not mappable (pa %llx "
++			    "len %llu)\n", r.surface_id, n,
++			    (unsigned long long)pa, (unsigned long long)length);
++			IOFreeData(pas, sizeof(uint64_t) * pages);
++			s->release();
++			return kIOReturnUnsupported;
++		}
++		pas[n++] = (uint64_t)pa;
++	}
++	rc = sm_bo_create_external(size, (uint64_t)kva, pas, pages, client,
++	    &handle);
++	IOFreeData(pas, sizeof(uint64_t) * pages);
++	switch (rc) {
++	case 0:
++		break;
++	case -1:
++		s->release();
++		return kIOReturnBadArgument;
++	case -2:
++		s->release();
++		return kIOReturnNoResources;
++	default:
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	/*
++	 * The reference sweet_surface_copy() gave us moves into the table:
++	 * `s` is deliberately not released on this path.  From here the only
++	 * thing that can drop it is CLOSE_BO or clientClose(), both of which
++	 * run after the core has taken the PTEs away.
++	 */
++	client->holdSurface(handle, s);
++	r.handle = handle;
++	r.gpu_va = sm_bo_va(handle);
++	SM_LOG("surface %u as BO %u: va=%llx size=%llu %ux%u bpr=%u "
++	    "off=%u fmt=%#x planes=%u\n", r.surface_id, handle,
++	    (unsigned long long)r.gpu_va, (unsigned long long)r.size,
++	    r.width, r.height, r.bytes_per_row, r.offset, r.pixel_format,
++	    r.planes);
++	return sm_uc_out(args, &r, sizeof(r));
++}
++
+ IOReturn
+ SweetMaliUserClient::externalMethod(uint32_t selector,
+     IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
+@@ -858,6 +1132,9 @@
+ 	case SM_SEL_LOG:
+ 		ret = sm_uc_log(args);
+ 		break;
++	case SM_SEL_SURFACE_BO:
++		ret = sm_uc_surface_bo(this, args);
++		break;
+ 	default:
+ 		/*
+ 		 * Log the first time an unknown selector is used, like the
+@@ -1637,6 +1914,704 @@
+ 	    nok, ntest, nbad ? ", see BAD lines above" : "");
+ }
+ 
++/* ------------------------------------------------------------------ *
++ * Stage E: an IOSurface's pixels as a BO
++ * ------------------------------------------------------------------ */
++
++/*
++ * What the job writes, where in the surface it writes, and the sentinel the
++ * CPU puts there first: the same write-value job D2 submits, with the target
++ * now inside an IOSurface.  The offset is inside the surface's first page and
++ * away from where any geometry would put a pixel row, so a match at that byte
++ * is the GPU having written the page.
++ */
++#define SM_E_VALUE1     0x0f0f0f0f0f0f0f0full
++#define SM_E_VALUE2     0xf0f0f0f0f0f0f0f0ull
++#define SM_E_VALUE3     0x1234abcd5678ef90ull
++#define SM_E_OFF        0x100u
++#define SM_E_SENTINEL   SM_D2_SENTINEL
++
++/*
++ * IOSurface.framework's lock result: the size the surface door answers and the
++ * fields of sweet_surface_fill_result() this stage reads.  The offsets are the
++ * door's ABI, so they are named here rather than spelled out at each use.
++ */
++#define SM_E_RESULT_SIZE    0xa68u
++#define SM_E_RESULT_PIXELS  0x00u
++#define SM_E_RESULT_ID      0x18u
++#define SM_E_RESULT_ALLOC   0x1cu
++#define SM_E_RESULT_W       0x20u
++#define SM_E_RESULT_H       0x24u
++#define SM_E_RESULT_BPR     0x28u
++#define SM_E_SEL_CREATE     0u      /* kSweetSurfaceCreate */
++#define SM_E_SURFACE_ROOT   "IOCoreSurfaceRoot"
++
++/*
++ * The property dictionary IOSurface.framework sends for a BGRA8 256x256
++ * surface with a 1024-byte row.  XML, because OSUnserializeXML() is what the
++ * door parses and it needs no plist writer behind it; 'BGRA' is 0x42475241
++ * (1111970369), the little-endian spelling of the four bytes a compositor
++ * means by "BGRA".
++ */
++static const char sm_e_props[] =
++	"<dict>"
++	"<key>IOSurfaceWidth</key><integer>256</integer>"
++	"<key>IOSurfaceHeight</key><integer>256</integer>"
++	"<key>IOSurfaceBytesPerElement</key><integer>4</integer>"
++	"<key>IOSurfaceBytesPerRow</key><integer>1024</integer>"
++	"<key>IOSurfacePixelFormat</key><integer>1111970369</integer>"
++	"</dict>";
++
++static uint32_t
++sm_e_u32(const uint8_t *p, uint32_t off)
++{
++	uint32_t v;
++
++	memcpy(&v, p + off, sizeof(v));
++	return v;
++}
++
++static uint64_t
++sm_e_u64(const uint8_t *p, uint32_t off)
++{
++	uint64_t v;
++
++	memcpy(&v, p + off, sizeof(v));
++	return v;
++}
++
++/* Close a handle through the door, ignoring the answer; used by the cleanup. */
++static void
++sm_e_close(IOUserClient *uc, uint32_t handle)
++{
++	struct sm_close_bo cl;
++
++	if (handle == 0) {
++		return;
++	}
++	memset(&cl, 0, sizeof(cl));
++	cl.handle = handle;
++	sm_uc_call(uc, SM_SEL_CLOSE_BO, &cl, sizeof(cl), NULL, 0);
++}
++
++/*
++ * Create a surface the way the frameworks do: open IOCoreSurfaceRoot, send it
++ * the property dictionary, and keep the lock result.  Field +0x00 of that
++ * result is the caller's own mapping of the pixels -- the window
++ * IOSurface.framework would hand an application -- and it is what the checks
++ * below read the GPU's write through.
++ *
++ * The client is deliberately left open: the mapping and the surface's creator
++ * user count live in it, so the stage keeps it until the end.  A surface whose
++ * last client has gone is dropped from the table, and the checks after the
++ * close would then be asking about a different surface.
++ */
++static IOUserClient *
++sm_e_surface_create(uint8_t *result, uint32_t *id_out)
++{
++	OSDictionary *match = IOService::serviceMatching(SM_E_SURFACE_ROOT);
++	IOService *svc;
++	IOUserClient *surf_uc = NULL;
++	IOExternalMethodArguments args;
++	kern_return_t kr;
++
++	if (match == NULL) {
++		SM_LOG("surface: serviceMatching failed\n");
++		return NULL;
++	}
++	svc = IOService::waitForService(match);	/* consumes the dictionary */
++	if (svc == NULL) {
++		SM_LOG("surface: %s not found\n", SM_E_SURFACE_ROOT);
++		return NULL;
++	}
++	kr = svc->newUserClient(current_task(), NULL, 0u, NULL, &surf_uc);
++	if (kr != kIOReturnSuccess || surf_uc == NULL) {
++		SM_LOG("surface: client kr=%x\n", kr);
++		return NULL;
++	}
++	memset(result, 0, SM_E_RESULT_SIZE);
++	memset(&args, 0, sizeof(args));
++	args.version = kIOExternalMethodArgumentsCurrentVersion;
++	args.structureInput = sm_e_props;
++	/*
++	 * The size includes the terminating NUL.  OSUnserializeXML() -- the
++	 * standard kernel entry point the door parses with -- requires an XML
++	 * buffer to be terminated *within* the size it is given (it answers NULL
++	 * when buffer[size - 1] != 0) and the door reports that as "bad property
++	 * dictionary".  Quoting the string as so many characters, which is the
++	 * first thing to reach for, is therefore the one thing that cannot work;
++	 * sizeof includes the terminator, which is what the parser checks for.
++	 */
++	args.structureInputSize = (uint32_t)sizeof(sm_e_props);
++	args.structureOutput = result;
++	args.structureOutputSize = SM_E_RESULT_SIZE;
++	kr = SM_UC_CALL(surf_uc, SM_E_SEL_CREATE, &args);
++	if (kr != kIOReturnSuccess) {
++		SM_LOG("surface: create kr=%x\n", kr);
++		surf_uc->clientClose();
++		surf_uc->release();
++		return NULL;
++	}
++	*id_out = sm_e_u32(result, SM_E_RESULT_ID);
++	return surf_uc;
++}
++
++/* What one write-value round trip through a surface BO produced. */
++struct sm_e_round {
++	IOReturn submit_kr;
++	uint32_t rawstat;
++	IOReturn sync_kr;
++	uint64_t readback;
++};
++
++/*
++ * One round trip: build the write-value job in the descriptor BO, poison the
++ * target byte, submit with both BOs listed, sync the target's cache and read
++ * it back through the CPU.  The poison is what makes the readback mean
++ * something -- a job that never ran leaves the sentinel, and the check that
++ * sees the value is the check that saw the GPU write.
++ *
++ * The descriptor goes out with an explicit cache clean, the handover D2 makes
++ * implicitly: the GPU is not coherent with the CPU, so a dirty descriptor line
++ * is a job the hardware reads as zeros.
++ */
++static void
++sm_e_write(IOUserClient *uc, uint32_t desc_bo, uint64_t jc, uint32_t target_bo,
++    uint64_t target_va, uint64_t value, uintptr_t target_kva,
++    struct sm_e_round *r)
++{
++	volatile uint32_t *desc = (volatile uint32_t *)sm_bo_kva(desc_bo);
++	struct sm_sync_bo syn;
++	struct sm_submit sub;
++	IOReturn kr;
++
++	memset(r, 0, sizeof(*r));
++	if (desc == NULL || target_kva == 0) {
++		return;
++	}
++	sm_d3_job(desc, target_va, value);
++	*(volatile uint64_t *)target_kva = SM_E_SENTINEL;
++
++	memset(&syn, 0, sizeof(syn));
++	syn.handle = desc_bo;
++	syn.type = SM_BO_SYNC_CPU_CACHE_FLUSH;
++	kr = sm_uc_call(uc, SM_SEL_SYNC_BO, &syn, sizeof(syn), NULL, 0);
++	if (kr != kIOReturnSuccess) {
++		SM_LOG("stage E: descriptor flush kr=%x\n", kr);
++	}
++
++	sm_uc_submit_init(&sub);
++	sub.jc = jc;
++	sub.bo_count = 2;
++	sub.bo_handles[0] = desc_bo;
++	sub.bo_handles[1] = target_bo;
++	r->submit_kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub,
++	    sizeof(sub));
++	r->rawstat = sub.rawstat;
++
++	memset(&syn, 0, sizeof(syn));
++	syn.handle = target_bo;
++	syn.type = SM_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE;
++	r->sync_kr = sm_uc_call(uc, SM_SEL_SYNC_BO, &syn, sizeof(syn), NULL, 0);
++	r->readback = *(volatile uint64_t *)target_kva;
++}
++
++/* Did the round trip run, finish, and leave `value` in the target's memory? */
++static bool
++sm_e_wrote(const struct sm_e_round *r, uint64_t value)
++{
++	return r->submit_kr == kIOReturnSuccess && (r->rawstat & 1u) != 0 &&
++	    (r->rawstat & (1u << 16)) == 0 && r->sync_kr == kIOReturnSuccess &&
++	    r->readback == value;
++}
++
++/*
++ * Stage E's checks.  The claim is one sentence -- the GPU writes the
++ * IOSurface's own pixels, and the CPU sees it there -- and every check below
++ * is a way the claim could be false: the pages not mapped, the mapping not the
++ * surface's memory, the close leaving a stale PTE, the memory freed while the
++ * display still scans it, the second buffer a compositor keeps not being the
++ * same pixels.
++ */
++static void
++sweet_mali_uc_test_e(IOUserClient *uc)
++{
++	struct sm_surface_bo sb;
++	struct sm_create_bo c;
++	struct sm_get_bo_offset g;
++	struct sm_mmap_bo mm;
++	struct sm_close_bo cl;
++	struct sm_submit sub;
++	struct sm_e_round r;
++	uint8_t res[SM_E_RESULT_SIZE];
++	IOUserClient *surf_uc = NULL;
++	SweetSurface *s = NULL, *chk = NULL, *panel = NULL;
++	uintptr_t kva = 0;
++	volatile uint64_t *win = NULL;
++	uint64_t va0 = 0, va1 = 0, va2 = 0, vaD = 0, vaP = 0;
++	uint32_t h0 = 0, h1 = 0, h2 = 0, hD = 0, hP = 0;
++	uint32_t id = 0, alloc = 0, visible = 0, tail = 0;
++	uint32_t nok = 0, ntest = 0, nbad = 0;
++	bool have0 = false, have1 = false, have2 = false, haveD = false;
++	bool haveP = false;
++	IOReturn kr;
++	bool ok;
++
++	SM_LOG("---- stage E ----\n");
++
++	/* 1: the surface itself, through the door the frameworks use */
++	surf_uc = sm_e_surface_create(res, &id);
++	ntest++;
++	ok = (surf_uc != NULL && id != 0 &&
++	    sm_e_u64(res, SM_E_RESULT_PIXELS) != 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s surface id=%u %ux%u bpr=%u alloc=%u window=%llx\n",
++	    ok ? "ok " : "BAD", id, sm_e_u32(res, SM_E_RESULT_W),
++	    sm_e_u32(res, SM_E_RESULT_H), sm_e_u32(res, SM_E_RESULT_BPR),
++	    sm_e_u32(res, SM_E_RESULT_ALLOC),
++	    (unsigned long long)sm_e_u64(res, SM_E_RESULT_PIXELS));
++	if (surf_uc == NULL || id == 0) {
++		goto out;
++	}
++	alloc = sm_e_u32(res, SM_E_RESULT_ALLOC);
++
++	/*
++	 * 2: the surface's own memory.  The client's window is a second mapping
++	 * of it, which is what makes every later "the value is in the surface"
++	 * a statement about the IOSurface rather than about a driver buffer.
++	 */
++	s = sweet_surface_copy(id);
++	kva = (s != NULL) ? s->kernelAddress() : 0;
++	ntest++;
++	ok = (s != NULL && s->memory != NULL && kva != 0 &&
++	    alloc == 256u * 1024u);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s surface memory %p (%u bytes, %u pages)\n", ok ? "ok " : "BAD",
++	    (void *)kva, alloc, alloc / SM_BO_PAGE_SIZE);
++
++	win = (volatile uint64_t *)sm_e_u64(res, SM_E_RESULT_PIXELS);
++	ntest++;
++	ok = (win != NULL);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s client window %p\n", ok ? "ok " : "BAD", (void *)win);
++	/*
++	 * The window is dereferenced only when the creating task is the kernel
++	 * task, which is what the address means in that case.  A client left
++	 * open by a user-process suite would have its window in *its* address
++	 * space and this thread must not touch it.
++	 */
++	if (ok && current_task() == kernel_task) {
++		*(volatile uint64_t *)win = 0x1122334455667788ull;
++		ntest++;
++		ok = (*(volatile uint64_t *)kva == 0x1122334455667788ull) &&
++		    (*(volatile uint64_t *)win == 0x1122334455667788ull);
++		if (ok) nok++; else nbad++;
++		SM_LOG("%s window and surface memory are the same bytes\n",
++		    ok ? "ok " : "BAD");
++	} else if (ok) {
++		SM_LOG("stage E: window not checked (creating task is not "
++		    "the kernel task)\n");
++	}
++
++	/* 3: DESCRIBE_ONLY answers the geometry and creates no BO */
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = id;
++	sb.handle = SM_SURFACE_DESCRIBE_ONLY;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sb.handle == 0 && sb.gpu_va == 0 &&
++	    sb.size == alloc && sb.width == 256u && sb.height == 256u &&
++	    sb.bytes_per_row == 1024u);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s DESCRIBE_ONLY size=%llu %ux%u bpr=%u fmt=%#x handle=%u "
++	    "va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    (unsigned long long)sb.size, sb.width, sb.height, sb.bytes_per_row,
++	    sb.pixel_format, sb.handle, (unsigned long long)sb.gpu_va, kr);
++
++	/* 4/5: an id the kernel does not know, on both paths */
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = 0xffffffffu;
++	sb.handle = SM_SURFACE_DESCRIBE_ONLY;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnNotFound);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s unknown surface id, describe: kr=%x\n", ok ? "ok " : "BAD",
++	    kr);
++
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = 0;
++	sb.handle = 0;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnNotFound);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s surface id 0: kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	/* 6: a handle that is neither 0 nor DESCRIBE_ONLY is refused */
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = id;
++	sb.handle = 7u;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SURFACE_BO handle=7: kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	/* 7: the surface's pages as a BO */
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = id;
++	sb.handle = 0;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	/*
++	 * `handle` is tested through sm_bo_present(), not against 0: a handle is
++	 * a slot index, slot 0 is as good as any, and the panel BO below lands
++	 * there precisely because the suite has closed everything else by then.
++	 * (Mesa's first CREATE_BO gets handle 0 the same way.)  What matters is
++	 * that the number names a live BO.
++	 */
++	ok = (kr == kIOReturnSuccess && sm_bo_present(sb.handle) == 1 &&
++	    sb.gpu_va != 0 && (sb.gpu_va & (SM_BO_PAGE_SIZE - 1u)) == 0 &&
++	    sb.size == alloc);
++	if (ok) {
++		nok++;
++		h0 = sb.handle;
++		va0 = sb.gpu_va;
++		have0 = true;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s SURFACE_BO handle=%u va=%llx size=%llu kr=%x\n",
++	    ok ? "ok " : "BAD", sb.handle, (unsigned long long)sb.gpu_va,
++	    (unsigned long long)sb.size, kr);
++
++	/* 8: and the pages really are in the GPU's address space */
++	ntest++;
++	ok = (have0 && sm_va_mapped(va0) != 0 && sm_bo_present(h0) == 1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s surface pages have a PTE at va=%llx\n", ok ? "ok " : "BAD",
++	    (unsigned long long)va0);
++
++	if (!have0) {
++		goto out;
++	}
++
++	/* 9: a second BO on the same surface: two mappings, two VAs, one set
++	 * of pixels -- what a compositor's double buffer is */
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = id;
++	sb.handle = 0;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sm_bo_present(sb.handle) == 1 &&
++	    sb.handle != h0 && sb.gpu_va != 0 && sb.gpu_va != va0 &&
++	    sm_va_mapped(sb.gpu_va) != 0);
++	if (ok) {
++		nok++;
++		h1 = sb.handle;
++		va1 = sb.gpu_va;
++		have1 = true;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s second mapping handle=%u va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    sb.handle, (unsigned long long)sb.gpu_va, kr);
++
++	/* 10: the descriptor BO the job chain lives in */
++	memset(&c, 0, sizeof(c));
++	c.size = SM_BO_PAGE_SIZE;
++	kr = sm_uc_call(uc, SM_SEL_CREATE_BO, &c, sizeof(c), &c, sizeof(c));
++	ntest++;
++	ok = (kr == kIOReturnSuccess);
++	if (ok) { nok++; hD = c.handle; haveD = true; } else nbad++;
++	SM_LOG("%s CREATE_BO descriptor handle=%u kr=%x\n", ok ? "ok " : "BAD",
++	    c.handle, kr);
++
++	if (!haveD) {
++		goto out;
++	}
++	memset(&g, 0, sizeof(g));
++	g.handle = hD;
++	kr = sm_uc_call(uc, SM_SEL_GET_BO_OFFSET, &g, sizeof(g), &g, sizeof(g));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && g.offset != 0);
++	if (ok) { nok++; vaD = g.offset; } else nbad++;
++	SM_LOG("%s descriptor va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    (unsigned long long)g.offset, kr);
++	if (vaD == 0) {
++		goto out;
++	}
++
++	/*
++	 * 11: the claim.  A write-value job whose target is the surface's VA
++	 * writes the surface's own pixels; the only thing that put the value
++	 * there is the GPU.
++	 */
++	sm_e_write(uc, hD, vaD, h0, va0 + SM_E_OFF, SM_E_VALUE1, kva + SM_E_OFF,
++	    &r);
++	ntest++;
++	ok = sm_e_wrote(&r, SM_E_VALUE1);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT -> surface[%#x]=%llx want=%llx rawstat=%x kr=%x "
++	    "sync=%x\n", ok ? "ok " : "BAD", SM_E_OFF,
++	    (unsigned long long)r.readback, (unsigned long long)SM_E_VALUE1,
++	    r.rawstat, r.submit_kr, r.sync_kr);
++
++	/* 12: the window IOSurface.framework would have handed the app */
++	if (win != NULL && current_task() == kernel_task) {
++		ntest++;
++		ok = (*(volatile uint64_t *)((uint8_t *)win + SM_E_OFF) ==
++		    SM_E_VALUE1);
++		if (ok) nok++; else nbad++;
++		SM_LOG("%s the client's window shows the GPU's value\n",
++		    ok ? "ok " : "BAD");
++	}
++
++	/* 13: the second mapping is the same pixels */
++	if (have1) {
++		sm_e_write(uc, hD, vaD, h1, va1 + SM_E_OFF, SM_E_VALUE2,
++		    kva + SM_E_OFF, &r);
++		ntest++;
++		ok = sm_e_wrote(&r, SM_E_VALUE2);
++		if (ok) nok++; else nbad++;
++		SM_LOG("%s SUBMIT through the second mapping -> surface[%#x]="
++		    "%llx want=%llx rawstat=%x kr=%x\n", ok ? "ok " : "BAD",
++		    SM_E_OFF, (unsigned long long)r.readback,
++		    (unsigned long long)SM_E_VALUE2, r.rawstat, r.submit_kr);
++	}
++
++	/* 14: MMAP_BO accepts a surface handle (E moved it to ownership:
++	 * there is no physical range to report, and a client that cannot map
++	 * the render target cannot read it back) */
++	memset(&mm, 0, sizeof(mm));
++	mm.handle = h0;
++	kr = sm_uc_call(uc, SM_SEL_MMAP_BO, &mm, sizeof(mm), &mm, sizeof(mm));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && mm.offset == h0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s MMAP_BO surface handle=%u offset=%llu kr=%x\n",
++	    ok ? "ok " : "BAD", h0, (unsigned long long)mm.offset, kr);
++
++	/* 15: close: the pages leave the address space, the memory stays */
++	memset(&cl, 0, sizeof(cl));
++	cl.handle = h0;
++	kr = sm_uc_call(uc, SM_SEL_CLOSE_BO, &cl, sizeof(cl), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sm_va_mapped(va0) == 0);
++	if (ok) { nok++; have0 = false; } else nbad++;
++	SM_LOG("%s CLOSE_BO surface BO kr=%x, no PTE left at %llx\n",
++	    ok ? "ok " : "BAD", kr, (unsigned long long)va0);
++
++	chk = sweet_surface_copy(id);
++	ntest++;
++	ok = (chk != NULL && chk->memory != NULL &&
++	    *(volatile uint64_t *)(kva + SM_E_OFF) == SM_E_VALUE2);
++	OSSafeReleaseNULL(chk);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s the surface survived the close with its pixels\n",
++	    ok ? "ok " : "BAD");
++
++	/* 16: and the handle is gone from every path that names BOs */
++	memset(&g, 0, sizeof(g));
++	g.handle = h0;
++	kr = sm_uc_call(uc, SM_SEL_GET_BO_OFFSET, &g, sizeof(g), &g, sizeof(g));
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s GET_BO_OFFSET after close: kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&mm, 0, sizeof(mm));
++	mm.handle = h0;
++	kr = sm_uc_call(uc, SM_SEL_MMAP_BO, &mm, sizeof(mm), &mm, sizeof(mm));
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s MMAP_BO after close: kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	sm_uc_submit_init(&sub);
++	sub.jc = vaD;
++	sub.bo_count = 2;
++	sub.bo_handles[0] = hD;
++	sub.bo_handles[1] = h0;
++	kr = sm_uc_call(uc, SM_SEL_SUBMIT, &sub, sizeof(sub), &sub, sizeof(sub));
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s SUBMIT after close: kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	memset(&cl, 0, sizeof(cl));
++	cl.handle = h0;
++	kr = sm_uc_call(uc, SM_SEL_CLOSE_BO, &cl, sizeof(cl), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnBadArgument);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s CLOSE_BO again: kr=%x\n", ok ? "ok " : "BAD", kr);
++
++	/* 17: a fresh BO on the same surface maps the same pixels again */
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = id;
++	sb.handle = 0;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sm_bo_present(sb.handle) == 1 &&
++	    sb.gpu_va != 0 && sm_va_mapped(sb.gpu_va) != 0);
++	if (ok) {
++		nok++;
++		h2 = sb.handle;
++		va2 = sb.gpu_va;
++		have2 = true;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s SURFACE_BO again handle=%u va=%llx kr=%x\n", ok ? "ok " : "BAD",
++	    sb.handle, (unsigned long long)sb.gpu_va, kr);
++
++	if (have2) {
++		sm_e_write(uc, hD, vaD, h2, va2 + SM_E_OFF, SM_E_VALUE3,
++		    kva + SM_E_OFF, &r);
++		ntest++;
++		ok = sm_e_wrote(&r, SM_E_VALUE3);
++		if (ok) nok++; else nbad++;
++		SM_LOG("%s SUBMIT through the remapped BO -> surface[%#x]=%llx "
++		    "want=%llx rawstat=%x kr=%x\n", ok ? "ok " : "BAD", SM_E_OFF,
++		    (unsigned long long)r.readback,
++		    (unsigned long long)SM_E_VALUE3, r.rawstat, r.submit_kr);
++	}
++
++	/*
++	 * 18: the panel.  The same sequence on the surface the display scans
++	 * out, which is the one that matters: a render target that is the
++	 * panel needs no copy, and the pages are the same ones the framebuffer
++	 * driver is reading.  The write goes to the round-page tail of the
++	 * allocation, past the last scanned row, so a proof that the GPU can
++	 * write the panel does not paint on it.
++	 */
++	panel = sweet_surface_default();
++	ntest++;
++	ok = (panel != NULL && panel->memory != NULL && panel->id != 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s panel surface id=%u %ux%u bpr=%u alloc=%u\n",
++	    ok ? "ok " : "BAD", panel != NULL ? panel->id : 0,
++	    panel != NULL ? panel->width : 0, panel != NULL ? panel->height : 0,
++	    panel != NULL ? panel->bytesPerRow : 0,
++	    panel != NULL ? panel->allocSize : 0);
++	if (panel == NULL || panel->memory == NULL || panel->id == 0) {
++		goto out;
++	}
++
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = panel->id;
++	sb.handle = SM_SURFACE_DESCRIBE_ONLY;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sb.size == panel->allocSize &&
++	    sb.width == panel->width && sb.height == panel->height &&
++	    sb.bytes_per_row == panel->bytesPerRow && sb.handle == 0);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s panel DESCRIBE_ONLY size=%llu %ux%u bpr=%u kr=%x\n",
++	    ok ? "ok " : "BAD", (unsigned long long)sb.size, sb.width,
++	    sb.height, sb.bytes_per_row, kr);
++
++	memset(&sb, 0, sizeof(sb));
++	sb.surface_id = panel->id;
++	sb.handle = 0;
++	kr = sm_uc_call(uc, SM_SEL_SURFACE_BO, &sb, sizeof(sb), &sb, sizeof(sb));
++	ntest++;
++	ok = (kr == kIOReturnSuccess && sm_bo_present(sb.handle) == 1 &&
++	    sb.gpu_va != 0 && sb.size == panel->allocSize &&
++	    sm_va_mapped(sb.gpu_va) != 0 &&
++	    (uintptr_t)sm_bo_kva(sb.handle) == panel->kernelAddress());
++	if (ok) {
++		nok++;
++		hP = sb.handle;
++		vaP = sb.gpu_va;
++		haveP = true;
++	} else {
++		nbad++;
++	}
++	SM_LOG("%s panel pages as a BO handle=%u va=%llx size=%llu kr=%x\n",
++	    ok ? "ok " : "BAD", sb.handle, (unsigned long long)sb.gpu_va,
++	    (unsigned long long)sb.size, kr);
++
++	if (haveP) {
++		visible = panel->bytesPerRow * panel->height;
++		tail = panel->allocSize > visible ? panel->allocSize - visible : 0;
++		if (tail >= sizeof(uint64_t)) {
++			uintptr_t pkva = panel->kernelAddress();
++			uint64_t poff = panel->allocSize - sizeof(uint64_t);
++
++			/*
++			 * Only the round-page tail [bpr*height, allocSize) is
++			 * outside the scanned rows, so this proves the write
++			 * without touching a visible pixel.
++			 */
++			sm_e_write(uc, hD, vaD, hP, vaP + poff, SM_E_VALUE1,
++			    pkva + poff, &r);
++			ntest++;
++			ok = sm_e_wrote(&r, SM_E_VALUE1);
++			if (ok) nok++; else nbad++;
++			SM_LOG("%s SUBMIT -> panel tail[%llu]=%llx want=%llx "
++			    "rawstat=%x kr=%x\n", ok ? "ok " : "BAD",
++			    (unsigned long long)poff,
++			    (unsigned long long)r.readback,
++			    (unsigned long long)SM_E_VALUE1, r.rawstat,
++			    r.submit_kr);
++		} else {
++			SM_LOG("stage E: no unscanned tail (%u visible of %u), "
++			    "panel write skipped\n", visible, panel->allocSize);
++		}
++	}
++
++	memset(&cl, 0, sizeof(cl));
++	cl.handle = hP;
++	kr = sm_uc_call(uc, SM_SEL_CLOSE_BO, &cl, sizeof(cl), NULL, 0);
++	ntest++;
++	ok = (kr == kIOReturnSuccess &&
++	    (vaP == 0 || sm_va_mapped(vaP) == 0));
++	if (ok) { nok++; haveP = false; } else nbad++;
++	SM_LOG("%s CLOSE_BO panel BO kr=%x, no PTE at %llx\n",
++	    ok ? "ok " : "BAD", kr, (unsigned long long)vaP);
++
++	chk = sweet_surface_copy(panel->id);
++	ntest++;
++	ok = (chk != NULL);
++	OSSafeReleaseNULL(chk);
++	if (ok) nok++; else nbad++;
++	SM_LOG("%s panel surface still published after the close\n",
++	    ok ? "ok " : "BAD");
++
++out:
++	if (have0) {
++		sm_e_close(uc, h0);
++	}
++	if (have1) {
++		sm_e_close(uc, h1);
++	}
++	if (have2) {
++		sm_e_close(uc, h2);
++	}
++	if (haveD) {
++		sm_e_close(uc, hD);
++	}
++	if (haveP) {
++		sm_e_close(uc, hP);
++	}
++	OSSafeReleaseNULL(panel);
++	OSSafeReleaseNULL(s);
++	/*
++	 * Finally the surface's creator: closing removes the client's window
++	 * and drops the user count the create took, so this stage's surface
++	 * leaves the table with it.
++	 */
++	if (surf_uc != NULL) {
++		surf_uc->clientClose();
++		surf_uc->release();
++	}
++	SM_LOG("%s (%u/%u%s)\n", (nok == ntest && nbad == 0) ? "PASS" : "FAIL",
++	    nok, ntest, nbad ? ", see BAD lines above" : "");
++}
++
+ extern "C" void
+ sweet_mali_uc_test(void)
+ {
+@@ -1786,6 +2761,15 @@
+ 	sweet_mali_uc_test_d3(uc);
+ 
+ 	/*
++	 * E is last and on the same connection: it is the stage that turns the
++	 * connection into something a compositor can use -- an IOSurface's
++	 * pages as a BO -- and it leaves every handle it made closed and the
++	 * surface table as it found it, so the close below is the same close a
++	 * userspace client makes.
++	 */
++	sweet_mali_uc_test_e(uc);
++
++	/*
+ 	 * The teardown a real close uses, in order: close the connection (our
+ 	 * clientClose() terminates the client), then drop the reference
+ 	 * newUserClient() returned retained.
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -195,6 +195,61 @@
+ 	}
+ }
+ 
++/*
++ * E: the display's own surface.
++ *
++ * Two references name the panel surface: the framebuffer's fSurface and this
++ * clamp.  The second exists because a surface BO can outlive the client that
++ * made it -- the kernel's self-test holds one across the whole stage, and a
++ * future compositor will hold one for as long as it has a render target --
++ * and because the pixels must not be freed while the panel is still scanning
++ * them out.  The clamp is never dropped: it is the display's, and the display
++ * lives as long as the kernel does.
++ */
++static SweetSurface *sweet_default_surface;
++
++void
++sweet_surface_set_default(SweetSurface *s)
++{
++	SweetSurface *old;
++
++	if (s == NULL) {
++		return;
++	}
++	sweet_surface_init_lock();
++	IOLockLock(sweet_surface_lock);
++	old = sweet_default_surface;
++	if (old != s) {
++		s->retain();
++		sweet_default_surface = s;
++	} else {
++		old = NULL;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	/* Only reachable if the display ever changes surface; kept correct so a
++	 * second one cannot leak the first. */
++	if (old != NULL) {
++		old->release();
++	}
++}
++
++SweetSurface *
++sweet_surface_default(void)
++{
++	SweetSurface *s;
++
++	if (sweet_surface_lock == NULL) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	s = sweet_default_surface;
++	if (s != NULL) {
++		s->retain();
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return s;
++}
++
+ static SweetSurface *
+ sweet_surface_alloc(void)
+ {
+@@ -666,7 +721,31 @@
+ 		args->structureInputDescriptor->readBytes(0, copy, len);
+ 		buf = copy;
+ 	}
+-	OSObject *obj = (buf != NULL && len > 0) ? OSUnserializeXML(buf, len) : NULL;
++	OSObject *obj = NULL;
++	if (buf != NULL && len > 0) {
++		obj = OSUnserializeXML(buf, len);
++		if (obj == NULL && buf[len - 1] != 0 &&
++		    len < SWEET_SURFACE_MAX_PROPS) {
++			/*
++			 * OSUnserializeXML() -- the standard entry point that also
++			 * dispatches the binary format -- insists that XML be
++			 * NUL-terminated *within* the size it is given (its own
++			 * buffer[bufferSize - 1] check) and returns NULL for a
++			 * string quoted as so many characters.  A caller that built
++			 * its property dictionary by hand rather than writing a
++			 * plist therefore arrives with no terminator: hand it one
++			 * and ask again, so the door answers "how big is your
++			 * surface" instead of "your dictionary is garbage".
++			 */
++			char *terminated = (char *)IOMallocData(len + 1);
++			if (terminated != NULL) {
++				memcpy(terminated, buf, len);
++				terminated[len] = 0;
++				obj = OSUnserializeXML(terminated, len + 1);
++				IOFreeData(terminated, len + 1);
++			}
++		}
++	}
+ 	if (copy != NULL) {
+ 		IOFreeData(copy, len);
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -61,5 +61,19 @@
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++/*
++ * E: the surface the display driver scans out.
++ *
++ * Stage E's promise is that a render target can be the surface the compositor
++ * is going to show, and that promise is only worth what the panel's own memory
++ * makes of it -- so the self-test runs the surface-BO sequence on this one
++ * too, and a later compositor looks it up the same way.  `set` takes its own
++ * reference (the framebuffer keeps the one it already has) and clamps the
++ * pointer: the display outlives every client.  `default` returns a retained
++ * surface, or NULL before the framebuffer has published one.
++ */
++void sweet_surface_set_default(SweetSurface *surface);
++SweetSurface *sweet_surface_default(void);
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
