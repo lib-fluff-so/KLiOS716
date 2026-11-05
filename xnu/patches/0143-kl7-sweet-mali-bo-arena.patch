@@ -1,0 +1,343 @@
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -579,6 +579,20 @@
+ 	uint32_t va_used[SM_VA_BITMAP_WORDS];
+ 	/* B1: BO handle table. */
+ 	struct sm_bo bo[SM_BO_MAX];
++	/*
++	 * F3: live BO accounting.  The mmap log says which BOs a frame binds;
++	 * these say how much memory panfrost is actually holding, which is the
++	 * number that decides whether the arena below is big enough.
++	 */
++	uint64_t bo_live_bytes;
++	uint64_t bo_peak_bytes;
++	uint32_t bo_live;
++	/* F4: composition of the live set, so the arena can be sized on data. */
++	uint64_t bo_big_bytes;
++	uint32_t bo_big_count;
++	uint64_t bo_ext_bytes;
++	uint32_t bo_ext_count;
++	uint64_t bo_max_size;
+ 	/* D3: sync object (fence) handle table. */
+ 	struct sm_syncobj sync[SM_SYNCOBJ_MAX];
+ 
+@@ -1312,6 +1326,150 @@
+ }
+ 
+ /*
++ * F3: the contiguous BO arena.
++ *
++ * Panfrost mmaps every BO it makes, and a BO can only be mapped into a client
++ * when its pages are physically adjacent.  Once iOS has been up for a minute
++ * the free page list is broken into pieces smaller than a single large BO:
++ * the crash ring shows vm_page_find_contiguous(737 pages = 2.9 MB) finding
++ * zero runs while ~1 GB of pages sat free, and a 12 MB BO then fell back to
++ * kmem_alloc(), which sm_bo_info() has to refuse, which makes Mesa close
++ * backboardd on the mmap EINVAL.
++ *
++ * The arena is one physically contiguous allocation taken while the machine
++ * is still empty.  BOs are carved out of it and returned to it, so a BO is
++ * always contiguous no matter what the rest of DRAM looks like.  smarena=<MB>
++ * sizes it (default 384, 0 disables); if it is exhausted the old
++ * IOMallocContiguous path is still tried.
++ */
++#define SM_BO_ARENA_MB_DEFAULT  640u
++#define SM_BO_ARENA_MB_MIN      64u
++
++struct sm_bo_arena {
++	vm_offset_t kva;
++	uint64_t pa;
++	uint64_t size;
++	uint32_t pages;
++	uint32_t words;
++	uint32_t *used;
++	uint32_t used_pages;
++};
++
++/* F4: total RAM the VM initialised (<mach/vm_param.h>). */
++extern uint64_t sane_size;
++
++static struct sm_bo_arena sm_arena;
++
++static boolean_t
++sm_arena_bit(uint32_t page)
++{
++	return (sm_arena.used[page >> 5] & (1u << (page & 31u))) != 0;
++}
++
++static boolean_t
++sm_arena_init(uint64_t bytes)
++{
++	uint32_t words;
++	void *kva;
++	void *bits;
++
++	bytes &= ~(uint64_t)(SM_GPU_PAGE_SIZE - 1u);
++	if (bytes < ((uint64_t)SM_BO_ARENA_MB_MIN << 20)) {
++		return FALSE;
++	}
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++	kva = IOMallocContiguous((vm_size_t)bytes, SM_GPU_PAGE_SIZE, NULL);
++#pragma clang diagnostic pop
++	if (kva == NULL) {
++		return FALSE;
++	}
++	words = (uint32_t)((bytes / SM_GPU_PAGE_SIZE + 31u) / 32u);
++	bits = IOMalloc((vm_size_t)words * sizeof(uint32_t));
++	if (bits == NULL) {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++		IOFreeContiguous(kva, (vm_size_t)bytes);
++#pragma clang diagnostic pop
++		return FALSE;
++	}
++	memset(bits, 0, (size_t)words * sizeof(uint32_t));
++	sm_arena.kva = (vm_offset_t)kva;
++	sm_arena.pa = (uint64_t)ml_vtophys((vm_offset_t)kva);
++	sm_arena.size = bytes;
++	sm_arena.pages = (uint32_t)(bytes >> 12);
++	sm_arena.words = words;
++	sm_arena.used = (uint32_t *)bits;
++	sm_arena.used_pages = 0;
++	printf("SWEETMALI: BO arena %llu MB at pa %llx kva %lx\n",
++	    bytes >> 20, sm_arena.pa, (unsigned long)sm_arena.kva);
++	return TRUE;
++}
++
++/*
++ * First fit over the arena bitmap.  `alignment` is honoured on the start page;
++ * everything the driver allocates here is page aligned anyway.
++ */
++static vm_offset_t
++sm_arena_alloc(uint64_t size, uint64_t alignment, uint64_t *pa)
++{
++	uint32_t need = (uint32_t)(size >> 12);
++	uint32_t step = (uint32_t)(alignment >> 12);
++	uint32_t page, i;
++
++	if (sm_arena.kva == 0 || need == 0 || need > sm_arena.pages ||
++	    need > sm_arena.pages - sm_arena.used_pages) {
++		return 0;
++	}
++	if (step == 0) {
++		step = 1;
++	}
++	for (page = 0; page + need <= sm_arena.pages; page += step) {
++		for (i = 0; i < need; i++) {
++			if (sm_arena_bit(page + i)) {
++				break;
++			}
++		}
++		if (i < need) {
++			continue;
++		}
++		for (i = 0; i < need; i++) {
++			sm_arena.used[(page + i) >> 5] |=
++			    1u << ((page + i) & 31u);
++		}
++		sm_arena.used_pages += need;
++		*pa = sm_arena.pa + ((uint64_t)page << 12);
++		return sm_arena.kva + ((vm_offset_t)page << 12);
++	}
++	return 0;
++}
++
++/* TRUE when kva came out of the arena and has been given back. */
++static boolean_t
++sm_arena_free(vm_offset_t kva, uint64_t size)
++{
++	uint64_t off;
++	uint32_t first, pages, i;
++
++	if (sm_arena.kva == 0 || kva < sm_arena.kva ||
++	    kva >= sm_arena.kva + (vm_offset_t)sm_arena.size) {
++		return FALSE;
++	}
++	off = (uint64_t)(kva - sm_arena.kva);
++	if ((off & (SM_GPU_PAGE_SIZE - 1u)) != 0 || off + size > sm_arena.size) {
++		return FALSE;
++	}
++	first = (uint32_t)(off >> 12);
++	pages = (uint32_t)(size >> 12);
++	for (i = 0; i < pages; i++) {
++		sm_arena.used[(first + i) >> 5] &=
++		    ~(1u << ((first + i) & 31u));
++	}
++	sm_arena.used_pages -= pages;
++	return TRUE;
++}
++
++/*
+  * Contiguous kernel allocation with a known physical address.  Passing NULL
+  * as IOMallocContiguous' physicalAddress argument takes the unrestricted
+  * kmem_alloc_contig path (the deprecated physicalAddress form builds a 32-bit
+@@ -1321,7 +1479,13 @@
+ sm_alloc_contig(vm_size_t size, vm_size_t alignment, uint64_t *pa)
+ {
+ 	void *kva;
+-
++	vm_offset_t arena_kva;
++
++	*pa = 0;
++	arena_kva = sm_arena_alloc((uint64_t)size, (uint64_t)alignment, pa);
++	if (arena_kva != 0) {
++		return arena_kva;
++	}
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+ 	kva = IOMallocContiguous(size, alignment, NULL);
+@@ -1861,6 +2025,9 @@
+ static void
+ sm_bo_free_mem(vm_offset_t kva, uint64_t size)
+ {
++	if (sm_arena_free(kva, size)) {
++		return;
++	}
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+ 	IOFreeContiguous((void *)kva, (vm_size_t)size);
+@@ -1938,6 +2105,28 @@
+ 	sm.bo[slot].used = TRUE;
+ 	sm.bo[slot].busy = FALSE;
+ 	sm.bo[slot].owner = NULL;
++	sm.bo_live++;
++	sm.bo_live_bytes += size;
++	if (sm.bo_live_bytes > sm.bo_peak_bytes) {
++		sm.bo_peak_bytes = sm.bo_live_bytes;
++	}
++	if (size >= (8ull << 20)) {
++		sm.bo_big_count++;
++		sm.bo_big_bytes += size;
++	}
++	if (size > sm.bo_max_size) {
++		sm.bo_max_size = size;
++	}
++	if ((sm.bo_live & 63u) == 0) {
++		printf("SWEETMALI: BO live=%u bytes=%llu KiB peak=%llu KiB "
++		    "arena=%u/%u KiB big=%u/%llu MiB max=%llu KiB "
++		    "ext=%u/%llu MiB mem=%llu MiB\n", sm.bo_live,
++		    sm.bo_live_bytes >> 10, sm.bo_peak_bytes >> 10,
++		    sm_arena.used_pages * 4u, sm_arena.pages * 4u,
++		    sm.bo_big_count, sm.bo_big_bytes >> 20,
++		    sm.bo_max_size >> 10, sm.bo_ext_count,
++		    sm.bo_ext_bytes >> 20, sane_size >> 20);
++	}
+ 	return 0;
+ }
+ 
+@@ -1979,6 +2168,40 @@
+ 		sm_bo_free_pages(bo->kva, bo->size);
+ 	} else {
+ 		sm_bo_free_mem(bo->kva, bo->size);
++	}
++	if (bo->external) {
++		/*
++		 * Surface-backed: the pages were never ours and the create
++		 * path never added them to the BO totals, so only the surface
++		 * counters move here.
++		 */
++		if (bo->size <= sm.bo_ext_bytes) {
++			sm.bo_ext_bytes -= bo->size;
++		} else {
++			sm.bo_ext_bytes = 0;
++		}
++		if (sm.bo_ext_count > 0) {
++			sm.bo_ext_count--;
++		}
++	} else {
++		if (bo->size <= sm.bo_live_bytes) {
++			sm.bo_live_bytes -= bo->size;
++		} else {
++			sm.bo_live_bytes = 0;
++		}
++		if (sm.bo_live > 0) {
++			sm.bo_live--;
++		}
++		if (bo->size >= (8ull << 20)) {
++			if (bo->size <= sm.bo_big_bytes) {
++				sm.bo_big_bytes -= bo->size;
++			} else {
++				sm.bo_big_bytes = 0;
++			}
++			if (sm.bo_big_count > 0) {
++				sm.bo_big_count--;
++			}
++		}
+ 	}
+ 	bo->kva = 0;
+ 	bo->pa = 0;
+@@ -2123,6 +2346,8 @@
+ 	sm.bo[slot].used = TRUE;
+ 	sm.bo[slot].busy = FALSE;
+ 	sm.bo[slot].owner = owner;
++	sm.bo_ext_count++;
++	sm.bo_ext_bytes += size;
+ 	*handle = slot;
+ 	return 0;
+ }
+@@ -4625,6 +4850,43 @@
+ 	}
+ 
+ 	printf("SWEETMALI: bring-up start\n");
++	/*
++	 * F3: take the BO arena before anything else allocates.  This is the
++	 * one moment when a few hundred MB are still one contiguous run.
++	 */
++	{
++		unsigned arena_mb = SM_BO_ARENA_MB_DEFAULT;
++		uint64_t bytes;
++		boolean_t got = FALSE;
++
++		(void)PE_parse_boot_argn("smarena", &arena_mb,
++		    sizeof(arena_mb));
++		if (arena_mb == 0) {
++			printf("SWEETMALI: BO arena disabled (smarena=0)\n");
++		} else {
++			/*
++			 * Halving loses too much: 640 -> 320 is worse than the
++			 * 384 that already proved too small, so step down by
++			 * 64 MB and keep the largest run the VM will give.
++			 */
++			for (bytes = (uint64_t)arena_mb << 20;
++			    bytes >= ((uint64_t)SM_BO_ARENA_MB_MIN << 20);) {
++				if (sm_arena_init(bytes)) {
++					got = TRUE;
++					break;
++				}
++				if (bytes <= (((uint64_t)SM_BO_ARENA_MB_MIN +
++				    64ull) << 20)) {
++					break;
++				}
++				bytes -= 64ull << 20;
++			}
++			if (!got) {
++				printf("SWEETMALI: no BO arena, BOs fall back "
++				    "to IOMallocContiguous\n");
++			}
++		}
++	}
+ 	if (!sm_map()) {
+ 		goto out;
+ 	}
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2251,6 +2251,18 @@
+ 
+ 	sane_size = mem_size - (avail_start - gPhysBase);
+ 	max_mem = mem_size;
++	/*
++	 * KL7: what the VM actually got.  iOS reports hw.memsize from these, so
++	 * this line is the difference between guessing at the device's RAM and
++	 * knowing it.
++	 */
++	printf("SWEETMEM: mem_size=%llu MB sane_size=%llu MB max_mem=%llu MB "
++	    "gPhysBase=%llx avail_start=%llx\n",
++	    (unsigned long long)(mem_size >> 20),
++	    (unsigned long long)(sane_size >> 20),
++	    (unsigned long long)(max_mem >> 20),
++	    (unsigned long long)gPhysBase,
++	    (unsigned long long)avail_start);
+ 	vm_kernel_slid_base = segLOWESTTEXT;
+ 	// vm_kernel_slide is set by arm_init()->arm_slide_rebase_and_sign_image()
+ 	vm_kernel_stext = segTEXTB;
