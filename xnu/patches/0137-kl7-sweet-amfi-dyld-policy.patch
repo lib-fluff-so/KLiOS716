@@ -1,0 +1,76 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -274,6 +274,56 @@
+ }
+ 
+ /*
++ * Policy "AMFI": dyld asks AMFI whether it may use DYLD_* variables and @
++ * paths with __mac_syscall("AMFI", 0x5a, &{in_flags, out_ptr}) -- libamfi's
++ * amfi_check_dyld_policy_self.  Apple's kext answers from the process's code
++ * signing state.  With no policy of that name the call fails with ENOPOLICY,
++ * dyld clears every policy bit, DYLD_INSERT_LIBRARIES is silently ignored
++ * (and @ paths are refused -- the F3 failure).  This port owns the whole
++ * filesystem, so every flag is granted.
++ */
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xff
++
++struct sweet_amfi_dyld_policy_request {
++	uint64_t        in_flags;
++	uint64_t        out_ptr;
++};
++
++static bool sweet_amfi_dyld_logged;
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct sweet_amfi_dyld_policy_request request;
++	uint64_t flags = SWEET_AMFI_DYLD_ALLOW_ALL;
++
++	if (call != 0x5a) {		/* only check_dyld_policy_self is used */
++		return EINVAL;
++	}
++	if (arg == 0) {
++		return EINVAL;
++	}
++	if (copyin(arg, &request, sizeof(request)) != 0) {
++		return EFAULT;
++	}
++	if (request.out_ptr == 0) {
++		return EINVAL;
++	}
++	if (copyout(&flags, (user_addr_t)request.out_ptr, sizeof(flags)) != 0) {
++		return EFAULT;
++	}
++	if (!sweet_amfi_dyld_logged) {
++		sweet_amfi_dyld_logged = true;
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: dyld policy for %s: in 0x%llx, allowing 0x%llx\n",
++		    name, (unsigned long long)request.in_flags,
++		    (unsigned long long)flags);
++	}
++	return 0;
++}
++
++/*
+  * Policy "Sandbox": libsystem_sandbox calls __mac_syscall("Sandbox", op,
+  * arg). Without a policy of that name every call fails with ENOPOLICY and
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+@@ -306,6 +356,7 @@
+ }
+ 
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+ };
+ 
+@@ -360,7 +411,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
