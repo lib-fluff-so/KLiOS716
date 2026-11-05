@@ -1,0 +1,76 @@
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -232,10 +232,12 @@
+  * both BO pools it allocates from (descriptors and shaders), the tiler heap
+  * and the sample-positions table -- so a limit of 8 turned every real draw
+  * into SM_SUBMIT_EBADARG (the exact refusal seen as PANFROST_SUBMIT rc=22).
+- * A job may name as many buffers as a client can hold at all (SM_BO_MAX, 32
+- * below), which is why the two numbers agree; the arrays are inline in struct
+- * sm_submit, so this is the one place the limit is spelled and both sides must
+- * be rebuilt together when it moves.
++ * This is not SM_BO_MAX: the handle table below is how many BOs a *client* may
++ * hold (raised for a real compositor, whose renderer caches the buffers it
++ * allocates from), while this is how many one job may name at once.  The
++ * arrays are inline in struct sm_submit, so this is the one place the limit is
++ * spelled and both sides must be rebuilt together when it moves -- which is
++ * why it is left where it was when the table below grew.
+  */
+ #define SM_SUBMIT_MAX_BOS       32u
+ #define SM_SUBMIT_MAX_SYNCS     8u
+@@ -245,8 +247,15 @@
+  * It is ABI because a handle is also the memory type a client passes to
+  * IOConnectMapMemory64(): the user client indexes its per-handle descriptor
+  * cache with it, and a handle at or above it must never reach that cache.
++ *
++ * 32 was the probe suite's three BOs with room to spare.  A compositor's
++ * renderer holds far more at once -- Panfrost keeps a pool of the buffers it
++ * allocates from -- and 32 filled up on the twelfth frame of the lock screen:
++ * every CREATE_BO after that was refused, and Panfrost, which does not expect
++ * a refusal, died on a null dereference a few frames later.  A handle is an
++ * index, so this is the one number that can move without moving the ABI.
+  */
+-#define SM_BO_MAX               32u
++#define SM_BO_MAX               256u
+ 
+ /*
+  * timeout_ns is relative: 0 polls, >0 waits that many nanoseconds, <0 means
+--- a/iokit/Kernel/arm/SweetMali.cpp
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -579,6 +579,26 @@
+ }
+ 
+ /* ---- D2: client memory and submission ---------------------------- */
++
++/*
++ * The refusals of CREATE_BO (-2: no free handle, -3: no GPU address in the
++ * area, -4: no page table for it) all reach userspace as one error, and the
++ * renderer dies of whichever it was without saying which.  The first one is
++ * spelled out here, so the ring names the table that ran out.
++ */
++static void
++sm_uc_bo_refused(uint64_t size, int rc)
++{
++	static boolean_t said = FALSE;
++
++	if (!said) {
++		said = TRUE;
++		IOLog("SWEETMALI: CREATE_BO refused size %llu rc %d%s\n", size, rc,
++		    rc == -2 ? " (SM_BO_MAX handles are in use)" :
++		    rc == -3 ? " (the GPU address area is full)" :
++		    " (no page table for the area)");
++	}
++}
+ 
+ /*
+  * CREATE_BO: one contiguous allocation mapped into the GPU's AS, addressed by
+@@ -610,8 +630,10 @@
+ 	case -1:
+ 		return kIOReturnBadArgument;
+ 	case -2:
++		sm_uc_bo_refused(c.size, rc);
+ 		return kIOReturnNoResources;
+ 	default:
++		sm_uc_bo_refused(c.size, rc);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	c.handle = handle;
