@@ -1,0 +1,176 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -8,7 +8,10 @@
+  *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
+  *           +0 offset alignment mask, +4 bytes-per-row alignment mask
+  *   sel 0   create: scalar [parent id], struct in = serialized property
+- *           dictionary (binary or XML), struct out = lock result (0xa68)
++ *           dictionary (binary or XML), struct out = lock result (0xa68).
++ *           IOSurfaceCreate() is IOSurfaceCreateChild(parent = NULL); a create
++ *           that names a parent is a slice of that parent's pixels and is
++ *           served that memory at its own offset, never a buffer of its own.
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
+  *   sel 6   wrap client image: struct in = 32 bytes of the caller's image
+  *           (address, width, height, pixel format, bytes an element, bytes a
+@@ -39,8 +42,11 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
+ 
+@@ -90,7 +96,7 @@
+ void
+ SweetSurface::free()
+ {
+-	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
++	if (!borrowed && OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+@@ -269,6 +275,7 @@
+ 		OSSafeReleaseNULL(s);
+ 		return NULL;
+ 	}
++	s->borrowed = false;
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
+ 	if (s->state == NULL) {
+@@ -710,6 +717,40 @@
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+ 	return ret;
++}
++
++/*
++ * The creation properties, one line each: IOSurface.framework sends the
++ * dictionary with its keys spelled out, and a line carrying several of them
++ * would be longer than the console log keeps (it drops the middle of a long
++ * line), so the numbers would be the part that went missing.
++ */
++static void
++sweet_surface_log_keys(SweetSurface *s, OSDictionary *props)
++{
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(props);
++	if (it == NULL) {
++		return;
++	}
++	OSObject *key;
++	while ((key = it->getNextObject()) != NULL) {
++		OSString *name = OSDynamicCast(OSString, key);
++		OSObject *value = name != NULL ? props->getObject(name) : NULL;
++		OSNumber *num = OSDynamicCast(OSNumber, value);
++		OSData *data = OSDynamicCast(OSData, value);
++		const char *kn = name != NULL ? name->getCStringNoCopy() : "?";
++		if (num != NULL) {
++			IOLog("SWEET SURF: k %u %s = %llu\n", s->id, kn,
++			    (unsigned long long)num->unsigned64BitValue());
++		} else if (data != NULL) {
++			IOLog("SWEET SURF: k %u %s = data %u\n", s->id, kn,
++			    (uint32_t)data->getLength());
++		} else {
++			IOLog("SWEET SURF: k %u %s = %s\n", s->id, kn,
++			    value != NULL ? value->getMetaClass()->getClassName() : "nil");
++		}
++	}
++	it->release();
+ }
+ 
+ IOReturn
+@@ -773,8 +814,52 @@
+ 		return kIOReturnNoMemory;
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
++	if (s->parentID == 0) {
++		/* The other way a caller names a slice's parent. */
++		OSNumber *sb = OSDynamicCast(OSNumber, props->getObject("IOSurfaceSuperbuffer"));
++		if (sb != NULL) {
++			s->parentID = sb->unsigned32BitValue();
++		}
++	}
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	if (ret == kIOReturnSuccess && s->parentID != 0) {
++		/*
++		 * A child: the parent holds the pixels, this surface is the window
++		 * onto them.  The window is the child's own offset (the surface
++		 * offset, or failing that its first plane's) into the parent's
++		 * memory, and the memory is the parent's -- mapped, not copied and
++		 * not zeroed, which is what a caller that drew through the parent
++		 * expects to find here.  Until this was honoured the child answered
++		 * with a zeroed buffer of its own: a slot with nothing in it,
++		 * however much the parent had been drawn into.
++		 */
++		SweetSurface *parent = sweet_surface_copy(s->parentID);
++		if (parent != NULL) {
++			if (parent->memory != NULL && !parent->borrowed) {
++				s->memory = parent->memory;
++				s->memory->retain();
++				s->mapCache = parent->mapCache;
++				s->borrowed = true;
++				if (s->offset == 0 && s->planeCount > 0) {
++					s->offset = s->planes[0].offset;
++				}
++				if (s->offset >= parent->allocSize) {
++					s->allocSize = 0;
++				} else if (s->offset + s->allocSize > parent->allocSize) {
++					s->allocSize = parent->allocSize - s->offset;
++				}
++				IOLog("SWEET SURF: child of %u at %u size %u\n",
++				    s->parentID, s->offset, s->allocSize);
++			} else {
++				IOLog("SWEET SURF: child of %u has no pixels of its own\n",
++				    s->parentID);
++			}
++			parent->release();
++		} else {
++			IOLog("SWEET SURF: child of %u: no such surface\n", s->parentID);
++		}
++	}
++	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -788,18 +873,22 @@
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+-			if (!sweet_surface_publish(s)) {
+-				ret = kIOReturnNoResources;
+-			}
+ 		}
++	}
++	if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++		ret = kIOReturnNoResources;
+ 	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 512) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+-		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u off %u parent %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, s->planeCount, s->allocSize, s->offset, s->parentID,
++		    props->getCount(), ret);
++		if (sweet_surface_creates_logged <= 64) {
++			sweet_surface_log_keys(s, props);
++		}
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -36,6 +36,7 @@
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
++	bool                      borrowed;     /* pixels are the parent surface's */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
