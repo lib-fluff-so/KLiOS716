@@ -1,0 +1,258 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -10,6 +10,10 @@
+  *   sel 0   create: scalar [parent id], struct in = serialized property
+  *           dictionary (binary or XML), struct out = lock result (0xa68)
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
++ *   sel 6   wrap client image: struct in = 32 bytes of the caller's image
++ *           (address, width, height, pixel format, bytes an element, bytes a
++ *           row, size), struct out = lock result; the surface is that memory,
++ *           mapped into the caller and wired for the GPU, not a copy
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+@@ -43,6 +47,8 @@
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -72,6 +78,10 @@
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static uint32_t      sweet_surface_wraps_logged;
++static uint32_t      sweet_surface_lookups_logged;
++static uint32_t      sweet_surface_ports_logged;
++static uint32_t      sweet_surface_unknown_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+@@ -465,6 +475,7 @@
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapClientImage(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -782,7 +793,7 @@
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 512) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		sweet_surface_creates_logged++;
+@@ -800,7 +811,150 @@
+ 	return ret;
+ }
+ 
++/*
++ * IOSurfaceClientWrapClientImage (selector 6): CoreAnimation has an image of
++ * its own -- the pictures it makes surfaces around -- and wants a surface over
++ * that very memory: the caller's, already there, not a copy.
++ *
++ * The input is 32 bytes -- the address of the pixels, the width, the height,
++ * the pixel format, the bytes an element, the bytes a row and the size the
++ * caller has -- and the answer is the same lock result a create answers with.
++ * The memory is mapped into the caller (which already has it) and wired for the
++ * GPU while a surface names it.
++ *
++ * Until this was implemented the selector fell through to the default answer,
++ * success with zeros, so the framework built a surface with id 0 and no
++ * geometry: the pictures and every run of text came out as a black or coloured
++ * rectangle, the colour of the glyph, because a texture that is never filled
++ * samples as nothing.
++ */
+ IOReturn
++IOSurfaceRootUserClient::wrapClientImage(IOExternalMethodArguments *args)
++{
++	uint8_t in[0x20];
++	uint64_t address, length;
++	uint32_t width, height, format, bytesPerElement, bytesPerRow, size;
++	uint32_t swapped = 0, id = 0, logged;
++	SweetSurface *s;
++	IOReturn ret;
++
++	if (args->structureInput != NULL && args->structureInputSize >= sizeof(in)) {
++		memcpy(in, args->structureInput, sizeof(in));
++	} else if (args->structureInputDescriptor != NULL &&
++	    args->structureInputDescriptor->getLength() >= sizeof(in)) {
++		args->structureInputDescriptor->readBytes(0, in, sizeof(in));
++	} else {
++		IOLog("SWEET SURF: wrapClientImage: no input (%u bytes)\n",
++		    (uint32_t)args->structureInputSize);
++		return kIOReturnBadArgument;
++	}
++	memcpy(&address, in + 0x00, sizeof(address));
++	memcpy(&width, in + 0x08, 4);
++	memcpy(&height, in + 0x0c, 4);
++	memcpy(&format, in + 0x10, 4);
++	memcpy(&bytesPerElement, in + 0x14, 4);
++	memcpy(&bytesPerRow, in + 0x18, 4);
++	memcpy(&size, in + 0x1c, 4);
++
++	logged = sweet_surface_wraps_logged++;
++	if (logged < 64 || (logged % 512) == 0) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET SURF: %s wrapClientImage #%u addr 0x%llx %ux%u fmt 0x%x bpe %u bpr %u size %u\n",
++		    name, logged + 1, (unsigned long long)address, width, height,
++		    format, bytesPerElement, bytesPerRow, size);
++	}
++
++	if (address == 0 || address >= (1ULL << 36) ||
++	    width == 0 || height == 0 ||
++	    width > SWEET_SURFACE_MAX_DIM || height > SWEET_SURFACE_MAX_DIM ||
++	    bytesPerElement == 0 || bytesPerElement > 64) {
++		return kIOReturnBadArgument;
++	}
++	if (bytesPerRow == 0) {
++		bytesPerRow = width * bytesPerElement;
++	} else if ((uint64_t)width * bytesPerElement > bytesPerRow &&
++	    (uint64_t)height * bytesPerElement <= bytesPerRow) {
++		/* The two dimensions may be the other way round: whichever one
++		 * fits inside a row is the width. */
++		uint32_t swap = width;
++		width = height;
++		height = swap;
++		swapped = 1;
++	}
++	if ((uint64_t)width * bytesPerElement > bytesPerRow ||
++	    (uint64_t)bytesPerRow * height > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnBadArgument;
++	}
++	/*
++	 * How far the image really goes: (height - 1) whole rows and the last
++	 * one only `width` elements wide.  `size` is exactly that count (every
++	 * image seen states it), and the caller's mapping ends there: the
++	 * address is an aligned offset into a page-rounded mmap, so a round-up
++	 * to a page reaches the page past the buffer, which belongs to somebody
++	 * else.  Mapping that page fails and the whole image is dropped -- which
++	 * is what the first 53 refusals were, and why whole runs of text and
++	 * rows of icons drew nothing.  `size` is believed only when it fits the
++	 * geometry it came with.
++	 */
++	if (size < (uint64_t)bytesPerRow * (height - 1) + (uint64_t)width * bytesPerElement ||
++	    size > (uint64_t)bytesPerRow * height) {
++		size = (uint32_t)((uint64_t)bytesPerRow * height);
++	}
++	length = size;
++	if (length == 0) {
++		return kIOReturnBadArgument;
++	}
++
++	/*
++	 * The memory has to be the caller's. A wrong reading of the fields lands
++	 * here, not in a fault: copyin() of both ends is the kernel's cheapest
++	 * way of asking "is this mapped in the task I am running for?".
++	 */
++	if (copyin((user_addr_t)address, in, 1) != 0 ||
++	    copyin((user_addr_t)(address + length - 1), in, 1) != 0) {
++		IOLog("SWEET SURF: wrapClientImage: 0x%llx (%u bytes) is not the caller's\n",
++		    (unsigned long long)address, (uint32_t)length);
++		return kIOReturnBadArgument;
++	}
++
++	s = sweet_surface_alloc();
++	if (s == NULL) {
++		return kIOReturnNoMemory;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = (uint16_t)bytesPerElement;
++	s->elementWidth = 1;
++	s->elementHeight = 1;
++	s->pixelFormat = format;
++	s->offset = 0;
++	s->planeCount = 0;
++	s->parentID = 0;
++	s->cacheMode = 0;
++	s->allocSize = (uint32_t)length;
++	s->memory = IOMemoryDescriptor::withAddressRange(address, length,
++	    kIODirectionInOut, fTask);
++	s->mapCache = kIOMapDefaultCache;
++	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	id = s->id;
++	ret = returnSurface(s, args);   /* maps it for the caller, answers the lock result */
++	s->release();
++	if (ret == kIOReturnSuccess && logged < 64) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET SURF: %s wrapClientImage -> id %u %ux%u bpr %u len %u%s\n",
++		    name, id, width, height, bytesPerRow, (uint32_t)length,
++		    swapped ? " (width and height swapped)" : "");
++	}
++	return ret;
++}
++
++IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+@@ -825,9 +979,17 @@
+ 			ret = sweet_surface_get(s) ? returnSurface(s, args) : kIOReturnNotFound;
+ 			s->release();
+ 		}
++		if (sweet_surface_lookups_logged < 256) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			sweet_surface_lookups_logged++;
++			IOLog("SWEET SURF: %s lookup id %u -> 0x%x\n", name, (uint32_t)arg0, ret);
++		}
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+ 	}
++	case kSweetSurfaceWrapClientImage:
++		return wrapClientImage(args);
+ 	case kSweetSurfaceLookupFromPort: {
+ 		OSObject *obj = NULL;
+ 		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
+@@ -835,6 +997,14 @@
+ 		if (ret == kIOReturnSuccess) {
+ 			ret = (s != NULL && sweet_surface_get(s)) ? returnSurface(s, args) : kIOReturnBadArgument;
+ 		}
++		if (sweet_surface_ports_logged < 256) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			sweet_surface_ports_logged++;
++			IOLog("SWEET SURF: %s lookupFromPort %u is_surface %u id %u %ux%u -> 0x%x\n",
++			    name, (uint32_t)arg0, s != NULL ? 1 : 0, s != NULL ? s->id : 0,
++			    s != NULL ? s->width : 0, s != NULL ? s->height : 0, ret);
++		}
+ 		OSSafeReleaseNULL(obj);
+ 		sweet_surf_log_once("sel", selector);
+ 		return ret;
+@@ -852,7 +1022,22 @@
+ 		return kIOReturnSuccess;
+ 	}
+ 	default:
+-		/* Values, notifications, ownership, timestamps...: accept and ignore. */
++		/* Values, notifications, ownership, timestamps...: accept and ignore.
++		 * The answer is success with zeros, so anything the caller expects to
++		 * be filled in arrives empty; log the calls that carry arguments,
++		 * because that is what a missing selector looks like from here. */
++		if (sweet_surface_unknown_logged < 512) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			sweet_surface_unknown_logged++;
++			IOLog("SWEET SURF: %s unhandled sel %u in %u [%llu %llu %llu %llu] struct %u/%u -> zeros\n",
++			    name, selector, args->scalarInputCount,
++			    args->scalarInputCount > 0 ? (unsigned long long)args->scalarInput[0] : 0ULL,
++			    args->scalarInputCount > 1 ? (unsigned long long)args->scalarInput[1] : 0ULL,
++			    args->scalarInputCount > 2 ? (unsigned long long)args->scalarInput[2] : 0ULL,
++			    args->scalarInputCount > 3 ? (unsigned long long)args->scalarInput[3] : 0ULL,
++			    (uint32_t)args->structureInputSize, (uint32_t)args->structureOutputSize);
++		}
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 			args->scalarOutput[i] = 0;
+ 		}
