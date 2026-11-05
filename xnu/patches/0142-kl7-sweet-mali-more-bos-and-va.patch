@@ -1,0 +1,88 @@
+--- a/bsd/sys/sweet_mali_abi.h
++++ b/bsd/sys/sweet_mali_abi.h
+@@ -239,7 +239,7 @@
+  * spelled and both sides must be rebuilt together when it moves -- which is
+  * why it is left where it was when the table below grew.
+  */
+-#define SM_SUBMIT_MAX_BOS       32u
++#define SM_SUBMIT_MAX_BOS       128u
+ #define SM_SUBMIT_MAX_SYNCS     8u
+ #define SM_SYNCOBJ_MAX          16u
+ /*
+@@ -255,7 +255,7 @@
+  * a refusal, died on a null dereference a few frames later.  A handle is an
+  * index, so this is the one number that can move without moving the ABI.
+  */
+-#define SM_BO_MAX               256u
++#define SM_BO_MAX               512u
+ 
+ /*
+  * timeout_ns is relative: 0 polls, >0 waits that many nanoseconds, <0 means
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -341,7 +341,7 @@
+ /*
+  * Stage A3/B1: a real GPU VA allocator and a BO allocator.
+  *
+- * A3 -- the area is a 256 MiB slice of the same PGD entry the window uses,
++ * A3 -- the area is a 1 GiB slice of the same PGD entry the window uses,
+  * reached through its own PUD entry (258), so nothing it does can disturb
+  * the identity maps, the window or the 4 KiB window.  A 4 KiB-granular
+  * bitmap hands out first-fit contiguous ranges, and the *table* pages (one
+@@ -356,18 +356,18 @@
+  */
+ #define SM_VA_AREA_BASE   (SM_VA_BASE + 0x80000000ull)	/* +2 GiB */
+ #define SM_VA_AREA_PUD_INDEX 258u	/* (SM_VA_AREA_BASE >> 30) & 0x1ff */
+-#define SM_VA_AREA_SIZE   (256ull << 20)
++#define SM_VA_AREA_SIZE   (1024ull << 20)
+ #define SM_VA_AREA_PAGES  ((uint32_t)(SM_VA_AREA_SIZE / SM_GPU_PAGE_SIZE))
+ #define SM_VA_BITMAP_WORDS ((SM_VA_AREA_PAGES + 31u) / 32u)
+ #define SM_VA_GUARD_OFF   0x400000ull	/* area + 4 MiB: never allocated */
+ /*
+  * PMD/PTE pages for the area.  One PTE page covers 2 MiB of VA, so covering
+- * the whole 256 MiB area takes 128 of them, plus the one PMD page the area
++ * the whole 1 GiB area takes 512 of them, plus the one PMD page the area
+  * hangs off.  It was 16 (about 30 MiB of VA) until the F3 bring-up: Mesa's
+  * panfrost asks for a 128 MiB tiler heap BO, and mapping that has to succeed
+  * while the pool is the only source of PTE pages.
+  */
+-#define SM_TABLE_POOL_PAGES 129u
++#define SM_TABLE_POOL_PAGES 513u
+ #define SM_TABLES_TOTAL_PAGES (SM_TABLES_PAGES + SM_TABLE_POOL_PAGES)
+ /*
+  * D2: a client owns handles, not slots, so the table is sized for a working
+@@ -2023,6 +2023,18 @@
+  * B2/F1 through IOConnectMapMemory64, and that mapping is what makes the
+  * descriptor "client-built" for a process rather than for the kernel thread.
+  */
++/* How much of the GPU VA area is handed out, for the refusal log below. */
++static uint64_t
++sm_va_used_kb(void)
++{
++	uint64_t pages = 0;
++
++	for (uint32_t i = 0; i < SM_VA_BITMAP_WORDS; i++) {
++		pages += (uint64_t)__builtin_popcount(sm.va_used[i]);
++	}
++	return pages * (SM_GPU_PAGE_SIZE / 1024);
++}
++
+ int
+ sm_bo_create(uint64_t size, void *owner, uint32_t *handle)
+ {
+@@ -2039,9 +2051,15 @@
+ 		}
+ 	}
+ 	if (slot == SM_BO_MAX) {
++		printf("SWEETMALI: BO refused: all %u slots used (%llu bytes wanted,"
++		    " VA %llu of %llu KiB)\n", (unsigned)SM_BO_MAX, size,
++		    sm_va_used_kb(), (uint64_t)(SM_VA_AREA_SIZE >> 10));
+ 		return -2;
+ 	}
+ 	if (sm_bo_open(slot, size) != 0) {
++		printf("SWEETMALI: BO refused: open failed (%llu bytes,"
++		    " VA %llu of %llu KiB)\n", size,
++		    sm_va_used_kb(), (uint64_t)(SM_VA_AREA_SIZE >> 10));
+ 		return -3;
+ 	}
+ 	sm.bo[slot].owner = owner;
