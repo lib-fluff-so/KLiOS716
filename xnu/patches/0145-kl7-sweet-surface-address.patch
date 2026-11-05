@@ -1,0 +1,80 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -12,6 +12,8 @@
+  *           IOSurfaceCreate() is IOSurfaceCreateChild(parent = NULL); a create
+  *           that names a parent is a slice of that parent's pixels and is
+  *           served that memory at its own offset, never a buffer of its own.
++ *           IOSurfaceAddress names memory the caller already holds: the
++ *           surface is a window onto it, not a buffer of its own.
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
+  *   sel 6   wrap client image: struct in = 32 bytes of the caller's image
+  *           (address, width, height, pixel format, bytes an element, bytes a
+@@ -746,8 +748,14 @@
+ 			IOLog("SWEET SURF: k %u %s = data %u\n", s->id, kn,
+ 			    (uint32_t)data->getLength());
+ 		} else {
+-			IOLog("SWEET SURF: k %u %s = %s\n", s->id, kn,
+-			    value != NULL ? value->getMetaClass()->getClassName() : "nil");
++			OSString *str = OSDynamicCast(OSString, value);
++			const char *sv = str != NULL ? str->getCStringNoCopy() : NULL;
++			if (sv != NULL) {
++				IOLog("SWEET SURF: k %u %s = str %.48s\n", s->id, kn, sv);
++			} else {
++				IOLog("SWEET SURF: k %u %s = %s\n", s->id, kn,
++				    value != NULL ? value->getMetaClass()->getClassName() : "nil");
++			}
+ 		}
+ 	}
+ 	it->release();
+@@ -860,6 +868,51 @@
+ 		}
+ 	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
++		/*
++		 * IOSurfaceAddress: the caller already holds the pixels and wants
++		 * the surface to be a window onto them -- a slice of a pool it
++		 * allocated, not a buffer of the surface's own.  Every surface
++		 * whose pixel format is 0 (the icons, the switch and slider
++		 * artwork, the wallpaper slices) is created this way and names its
++		 * memory here, and no surface that can draw on its own does.  The
++		 * framework answers "where are my pixels" with the base of this
++		 * window, so serving a fresh zeroed buffer instead means the window
++		 * shows nothing the caller drew -- and since the caller keeps using
++		 * its own memory, nothing ever writes the surface either.
++		 */
++		OSNumber *pixels = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++		if (pixels != NULL && pixels->unsigned64BitValue() != 0) {
++			uint64_t addr = pixels->unsigned64BitValue();
++			uint64_t need = (uint64_t)s->offset +
++			    (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++			uint8_t probe;
++			/*
++			 * The memory has to be the caller's: copyin() of both ends
++			 * is the kernel's cheapest way of asking "is this mapped in
++			 * the task I am running for?".  A wrong reading of the key
++			 * lands here, not in a fault.
++			 */
++			if (need != 0 && need <= SWEET_SURFACE_MAX_ALLOC &&
++			    addr != 0 && addr < (1ULL << 36) &&
++			    copyin((user_addr_t)addr, &probe, 1) == 0 &&
++			    copyin((user_addr_t)(addr + need - 1), &probe, 1) == 0) {
++				s->memory = IOMemoryDescriptor::withAddressRange(addr, need,
++				    kIODirectionInOut, fTask);
++				if (s->memory != NULL) {
++					s->borrowed = true;
++					s->mapCache = kIOMapDefaultCache;
++					IOLog("SWEET SURF: create: 0x%llx (%u bytes, %ux%u) is the caller's\n",
++					    (unsigned long long)addr, (uint32_t)need,
++					    s->width, s->height);
++				}
++			} else {
++				IOLog("SWEET SURF: create: 0x%llx (%u bytes, %ux%u) is not the caller's\n",
++				    (unsigned long long)addr, (uint32_t)need,
++				    s->width, s->height);
++			}
++		}
++	}
++	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
