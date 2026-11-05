@@ -1,0 +1,96 @@
+--- a/bsd/dev/sweet_mali.c
++++ b/bsd/dev/sweet_mali.c
+@@ -2929,6 +2929,28 @@
+  * a counted check rather than a hope.
+  */
+ static int sm_case_reset(void);
++
++static uint64_t
++sm_now_us(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000ull;
++}
++
++/*
++ * The cache sweeps a submission does over its listed BOs.  F1 swept every one of
++ * them in full, twice a job, and panfrost lists eight a job -- the frames among
++ * them, so tens of megabytes -- which put more time into cache maintenance than
++ * into the GPU.  Boot-arg smcache is a size threshold in KB: a BO no larger than
++ * it is still swept (descriptors, uniforms and vertex data are, whatever else
++ * happens), a larger one is left to the client and to SM_SEL_SYNC_BO, which is
++ * where panfrost asks for cache work.  Absent, every BO is swept, as F1 did.
++ * The timings are logged either way, so what the sweeps cost stays visible.
++ */
++static int64_t sm_sweep_kb = -1;
++static int sm_sweep_asked;
+ 
+ int
+ sm_client_submit(uint64_t jc, const uint32_t *handles, uint32_t count,
+@@ -2943,6 +2965,8 @@
+ 	uint32_t hoff;
+ 	uint32_t hdr[16];
+ 	uint32_t i;
++	uint64_t submit_began, job_began, job_end, submit_end, swept, sweep_us;
++	uint64_t swept_us = 0;
+ 
+ 	if (!sm.ready || sm.gpu == 0) {
+ 		return SM_SUBMIT_ENOTREADY;
+@@ -3009,11 +3033,27 @@
+ 		}
+ 	}
+ 
++	if (!sm_sweep_asked) {
++		int v = 0;
++
++		sm_sweep_asked = 1;
++		if (PE_parse_boot_argn("smcache", &v, sizeof(v))) {
++			sm_sweep_kb = v;
++		}
++	}
++	swept = 0;
++	submit_began = sm_now_us();
+ 	for (i = 0; i < count; i++) {
+ 		sm.bo[handles[i]].busy = TRUE;
+-		sm_cache_clean_invalidate(sm.bo[handles[i]].kva,
+-		    sm.bo[handles[i]].size);
++		swept += sm.bo[handles[i]].size;
++		if (sm_sweep_kb < 0 ||
++		    sm.bo[handles[i]].size <= (uint64_t)sm_sweep_kb << 10) {
++			sm_cache_clean_invalidate(sm.bo[handles[i]].kva,
++			    sm.bo[handles[i]].size);
++			swept_us += sm.bo[handles[i]].size;
++		}
+ 	}
++	job_began = sm_now_us();
+ 	/*
+ 	 * F3: DATA_INVALID_FAULT names no address.  The header's words 0..3
+ 	 * are the exception record the hardware writes, so the descriptor the
+@@ -3043,11 +3083,23 @@
+ 	 * MMU register once, and treat it as a fault before the timeout path.
+ 	 */
+ 	mmu = sm_rd(sm.gpu + SM_MMU_INT_RAWSTAT);
++	job_end = sm_now_us();
+ 	for (i = 0; i < count; i++) {
+-		sm_cache_clean_invalidate(sm.bo[handles[i]].kva,
+-		    sm.bo[handles[i]].size);
++		if (sm_sweep_kb < 0 ||
++		    sm.bo[handles[i]].size <= (uint64_t)sm_sweep_kb << 10) {
++			sm_cache_clean_invalidate(sm.bo[handles[i]].kva,
++			    sm.bo[handles[i]].size);
++		}
+ 		sm.bo[handles[i]].busy = FALSE;
+ 	}
++	submit_end = sm_now_us();
++	sweep_us = (job_began - submit_began) + (submit_end - job_end);
++	if (submit_end - submit_began >= 2000) {
++		printf("SWEETMALI: submit slow %llu us (sweep %llu us, %llu of %llu KB "
++		    "swept, threshold %lld KB; job %llu us) bo=%u slot=%u\n",
++		    submit_end - submit_began, sweep_us, swept_us >> 10, swept >> 10,
++		    (long long)sm_sweep_kb, job_end - job_began, count, slot);
++	}
+ 	/* A finished job is a finished job, fault or not: never leave a waiter. */
+ 	if (out_sync != 0) {
+ 		sm_syncobj_signal(out_sync);
